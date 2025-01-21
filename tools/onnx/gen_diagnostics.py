@@ -17,12 +17,14 @@ import os
 import string
 import subprocess
 import textwrap
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import yaml
 
 from torchgen import utils as torchgen_utils
 from torchgen.yaml_utils import YamlLoader
+
 
 _RULES_GENERATED_COMMENT = """\
 GENERATED CODE - DO NOT EDIT DIRECTLY
@@ -55,7 +57,7 @@ class _{pascal_case_name}(infra.Rule):
         self,
         level: infra.Level,
         {message_arguments}
-    ) -> Tuple[infra.Rule, infra.Level, str]:
+    ) -> tuple[infra.Rule, infra.Level, str]:
         \"\"\"Returns a tuple of (Rule, Level, message) for this Rule.
 
         Message template: {message_template}
@@ -205,7 +207,7 @@ def gen_diagnostics(
     out_cpp_dir: str,
     out_docs_dir: str,
 ) -> None:
-    with open(rules_path, "r") as f:
+    with open(rules_path) as f:
         rules = yaml.load(f, Loader=YamlLoader)
 
     template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")

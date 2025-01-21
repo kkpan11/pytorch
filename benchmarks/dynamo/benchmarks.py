@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
+
 import argparse
 import os
-
-from typing import Set
+import sys
 
 
 # Note - hf and timm have their own version of this, torchbench does not
 # TOOD(voz): Someday, consolidate all the files into one runner instead of a shim like this...
-def model_names(filename: str) -> Set[str]:
+def model_names(filename: str) -> set[str]:
     names = set()
-    with open(filename, "r") as fh:
+    with open(filename) as fh:
         lines = fh.readlines()
         lines = [line.rstrip() for line in lines]
         for line in lines:
@@ -87,7 +87,7 @@ if __name__ == "__main__":
             torchbench.torchbench_main()
         else:
             print(f"Illegal model name? {name}")
-            exit(-1)
+            sys.exit(-1)
     else:
         import torchbench
 

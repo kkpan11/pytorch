@@ -2,14 +2,15 @@
 #include <ATen/TracerMode.h>
 #include <ATen/core/op_registration/op_registration.h>
 #include <c10/core/ScalarType.h>
-#include <c10/util/Optional.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/autograd/FunctionsManual.h>
 #include <torch/csrc/autograd/VariableTypeUtils.h>
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/functions/utils.h>
-#include <torch/csrc/utils/memory.h>
+#include <torch/csrc/autograd/generated/VariableType.h>
+#include <torch/csrc/autograd/generated/ViewFuncs.h>
 #include <torch/library.h>
+#include <optional>
 
 #include <utility>
 
@@ -19,10 +20,10 @@ using torch::autograd::as_view;
 using torch::autograd::CreationMeta;
 
 namespace torch {
-namespace autograd {
-namespace VariableType {
 
-std::vector<at::DeprecatedTypeProperties*> allTypesForBackends(
+namespace autograd::VariableType {
+
+static std::vector<at::DeprecatedTypeProperties*> allTypesForBackends(
     at::ArrayRef<at::Backend> backends) {
   std::vector<DeprecatedTypeProperties*> res;
   res.reserve(backends.size());
@@ -37,17 +38,23 @@ std::vector<at::DeprecatedTypeProperties*> allTypesForBackends(
   return res;
 }
 
-C10_EXPORT std::vector<at::DeprecatedTypeProperties*> allCPUTypes() {
+std::vector<at::DeprecatedTypeProperties*> allCPUTypes() {
   return allTypesForBackends({Backend::CPU, Backend::SparseCPU});
 }
 
-C10_EXPORT std::vector<at::DeprecatedTypeProperties*> allCUDATypes() {
-  at::globalContext().lazyInitCUDA();
+std::vector<at::DeprecatedTypeProperties*> allCUDATypes() {
+  at::globalContext().lazyInitDevice(c10::DeviceType::CUDA);
   return allTypesForBackends({Backend::CUDA, Backend::SparseCUDA});
 }
 
-C10_EXPORT std::vector<at::DeprecatedTypeProperties*> allXPUTypes() {
+std::vector<at::DeprecatedTypeProperties*> allXPUTypes() {
   return allTypesForBackends({Backend::XPU, Backend::SparseXPU});
+}
+
+std::vector<at::DeprecatedTypeProperties*> allPrivateUser1Types() {
+  at::globalContext().lazyInitDevice(c10::DeviceType::PrivateUse1);
+  return allTypesForBackends(
+      {Backend::PrivateUse1, Backend::SparsePrivateUse1});
 }
 
 namespace {
@@ -56,7 +63,8 @@ const Variable& checked_cast_variable(
     const char* name,
     int pos) {
   if (!t.defined()) {
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "Expected a proper Tensor but got None (or an undefined Tensor in C++) ",
         "for argument #",
         pos,
@@ -69,7 +77,8 @@ const Variable& checked_cast_variable(
 
 Variable& checked_cast_variable(Tensor& t, const char* name, int pos) {
   if (!t.defined()) {
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "Expected a proper Tensor but got None (or an undefined Tensor in C++) ",
         "for argument #",
         pos,
@@ -97,7 +106,7 @@ Tensor unpack_opt(const Tensor& t, const char* name, int pos) {
 }
 
 std::vector<at::Tensor> unpack(
-    at::ITensorListRef tl,
+    const at::ITensorListRef& tl,
     const char* name,
     int pos) {
   std::vector<at::Tensor> ret;
@@ -233,10 +242,10 @@ const Tensor& resize_(
     c10::DispatchKeySet ks,
     const Tensor& self,
     SymIntArrayRef size,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   auto& self_ = unpack(self, "self", 0);
   if (self.requires_grad()) {
-    AT_ERROR("cannot resize variables that require grad");
+    TORCH_CHECK(false, "cannot resize variables that require grad");
   }
   {
     at::AutoDispatchBelowAutograd mode;
@@ -245,7 +254,7 @@ const Tensor& resize_(
   }
 
   if (self._fw_grad(/* level */ 0).defined()) {
-    AT_ERROR("cannot resize variables that has a forward grad");
+    TORCH_CHECK(false, "cannot resize variables that has a forward grad");
   }
 
   return self;
@@ -255,11 +264,11 @@ const Tensor& resize_as_(
     c10::DispatchKeySet ks,
     const Tensor& self,
     const Tensor& the_template,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   auto& self_ = unpack(self, "self", 0);
   auto& the_template_ = unpack(the_template, "the_template", 1);
   if (self.requires_grad()) {
-    AT_ERROR("cannot resize variables that require grad");
+    TORCH_CHECK(false, "cannot resize variables that require grad");
   }
   {
     at::AutoDispatchBelowAutograd mode;
@@ -272,7 +281,7 @@ const Tensor& resize_as_(
 
   // Handle fw grad
   if (self._fw_grad(/* level */ 0).defined()) {
-    AT_ERROR("cannot resize variables that has a forward grad");
+    TORCH_CHECK(false, "cannot resize variables that has a forward grad");
   }
 
   return self;
@@ -296,7 +305,8 @@ Tensor& detach_(c10::DispatchKeySet ks, Tensor& self) {
   RECORD_FUNCTION("detach_", std::vector<c10::IValue>({self}));
   if (self.is_view()) {
     // See NOTE [ View + Inplace detection ]
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "Can't detach views in-place. Use detach() instead. "
         "If you are using DistributedDataParallel (DDP) for training, "
         "and gradient_as_bucket_view is set as True, gradients are "
@@ -365,8 +375,7 @@ TORCH_LIBRARY_IMPL(aten, Autograd, m) {
 }
 
 } // namespace
-} // namespace VariableType
-} // namespace autograd
+} // namespace autograd::VariableType
 
 namespace ADInplaceOrView {
 #define CREATION_META_DEFINITION                            \
@@ -375,7 +384,7 @@ namespace ADInplaceOrView {
       : (at::GradMode::is_enabled() ? CreationMeta::DEFAULT \
                                     : CreationMeta::NO_GRAD_MODE)
 
-Tensor& copy_(
+static Tensor& copy_(
     c10::DispatchKeySet ks,
     Tensor& self,
     const Tensor& src,
@@ -389,11 +398,11 @@ Tensor& copy_(
   return self;
 }
 
-const Tensor& resize_(
+static const Tensor& resize_(
     c10::DispatchKeySet ks,
     const Tensor& self,
     SymIntArrayRef size,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   // Hold sizes to verify if we actually resize `self`.
   // Explicitly copy data, since resizing can move original data
   // and make references invalid.
@@ -413,11 +422,11 @@ const Tensor& resize_(
   return self;
 }
 
-const Tensor& resize_as_(
+static const Tensor& resize_as_(
     c10::DispatchKeySet ks,
     const Tensor& self,
     const Tensor& the_template,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   // Hold sizes to verify if we actually resize `self`.
   // Explicitly copy data, since resizing can move original data
   // and make references invalid.
@@ -438,7 +447,7 @@ const Tensor& resize_as_(
   return self;
 }
 
-Tensor detach(c10::DispatchKeySet ks, const Tensor& self) {
+static Tensor detach(c10::DispatchKeySet ks, const Tensor& self) {
   auto out = ([&]() {
     at::AutoDispatchBelowADInplaceOrView guard;
     return at::_ops::detach::redispatch(
@@ -447,29 +456,36 @@ Tensor detach(c10::DispatchKeySet ks, const Tensor& self) {
   // NB: we can't make detach() a normal view operator because the codegen
   // generates allow_tensor_metadata_change = True for them. In the future we
   // should have an option for this in the codegen.
-  std::function<at::Tensor(const at::Tensor&)> func = nullptr;
   auto result = as_view(
       /* base */ self,
       /* output */ out,
       /* is_bw_differentiable */ false,
       /* is_fw_differentiable */ false,
-      /* view_func */ std::move(func),
+      /* view_func */ nullptr,
+      /* rev_view_func */ nullptr,
       /* creation_meta */ CreationMeta::DEFAULT,
       /*allow_tensor_metadata_change=*/false);
 
   return result;
 }
 
-Tensor _fw_primal(c10::DispatchKeySet ks, const Tensor& self, int64_t level) {
+static Tensor _fw_primal(
+    c10::DispatchKeySet ks,
+    const Tensor& self,
+    int64_t level) {
   auto tmp = ([&]() {
     at::AutoDispatchBelowADInplaceOrView guard;
     return at::alias(self);
   })();
-  std::function<at::Tensor(const at::Tensor&)> func = nullptr;
+  std::unique_ptr<torch::autograd::ViewFunc> func(nullptr);
+  std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!self.unsafeGetTensorImpl()->support_as_strided()) {
-    auto size_vec = self.sizes().vec();
-    func = [=](const at::Tensor& input_base) {
-      return input_base.view(size_vec);
+    func = std::make_unique<ViewViewFunc>(self.sym_sizes());
+    rev_func = [=](const at::Tensor& input_view) {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "Reverse view_func for _fw_primal() is not currently supported");
+      return Tensor();
     };
   }
   auto result = as_view(
@@ -478,13 +494,14 @@ Tensor _fw_primal(c10::DispatchKeySet ks, const Tensor& self, int64_t level) {
       /* is_bw_differentiable */ true,
       /* is_fw_differentiable */ false,
       /* view_func */ std::move(func),
+      /* rev_view_func */ std::move(rev_func),
       /* creation_meta */ CREATION_META_DEFINITION);
 
   return result;
 }
 
 // NB: This does not redispatch any further
-Tensor _make_dual(
+static Tensor _make_dual(
     c10::DispatchKeySet ks,
     const Tensor& primal,
     const Tensor& tangent,
@@ -493,11 +510,15 @@ Tensor _make_dual(
     at::AutoDispatchBelowADInplaceOrView guard;
     return at::alias(primal);
   })();
-  std::function<at::Tensor(const at::Tensor&)> func = nullptr;
+  std::unique_ptr<torch::autograd::ViewFunc> func(nullptr);
+  std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!primal.unsafeGetTensorImpl()->support_as_strided()) {
-    auto size_vec = primal.sizes().vec();
-    func = [=](const at::Tensor& input_base) {
-      return input_base.view(size_vec);
+    func = std::make_unique<ViewViewFunc>(primal.sym_sizes());
+    rev_func = [=](const at::Tensor& input_view) {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "Reverse view_func for _make_dual() is not currently supported");
+      return Tensor();
     };
   }
   auto result = as_view(
@@ -506,6 +527,7 @@ Tensor _make_dual(
       /* is_bw_differentiable */ true,
       /* is_fw_differentiable */ false,
       /* view_func */ std::move(func),
+      /* rev_view_func */ std::move(rev_func),
       /* creation_meta */ CREATION_META_DEFINITION);
 
   return result;

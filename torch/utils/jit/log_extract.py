@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 from contextlib import contextmanager
 from typing import Any, List, Tuple, cast
 import random
@@ -9,9 +10,8 @@ def extract_ir(filename: str) -> List[str]:
     BEGIN = "<GRAPH_EXPORT>"
     END = "</GRAPH_EXPORT>"
     pfx = None
-    current = ""
     graphs = []
-    with open(filename, "r") as f:
+    with open(filename) as f:
         split_strs = f.read().split(BEGIN)
         for i, split_str in enumerate(split_strs):
             if i == 0:

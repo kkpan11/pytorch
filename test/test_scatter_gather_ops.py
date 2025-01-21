@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Owner(s): ["module: scatter & gather ops"]
 
 import random
@@ -277,7 +276,7 @@ class TestScatterGather(TestCase):
                 self.assertEqual(input, expected_result)
 
     @onlyCPU
-    @dtypes(torch.float32, torch.float64, torch.bfloat16)
+    @dtypes(torch.float32, torch.float64, torch.bfloat16, torch.float16)
     def test_scatter_expanded_index(self, device, dtype):
         def helper(input_size, idx_size):
             input = torch.randn(input_size, device=device).to(dtype=dtype)
@@ -303,7 +302,6 @@ class TestScatterGather(TestCase):
 
             out = input.scatter_add(0, idx, src)
             out2 = input2.scatter_add(0, idx2, src)
-
             self.assertEqual(out, out2)
 
             for reduce in ["sum", "prod", "mean", "amax", "amin"]:
@@ -349,6 +347,26 @@ class TestScatterGather(TestCase):
             out = torch.gather(input, 0, idx)
             out2 = torch.gather(input2, 0, idx2)
 
+            self.assertEqual(out, out2)
+
+            # test unsqueezed index
+            # expanded_index kernel can not handle the case:
+            # the size > 1 and stride == 1 at a dimension.
+            # for example: the index with size of [1, 8, 7],  stride of [1, 1, 0].
+            # see https://github.com/pytorch/pytorch/issues/129093
+            def unsqueeze_helper(idx, dim):
+                if dim == 2:
+                    return idx.unsqueeze(1).t()
+                else:
+                    return unsqueeze_helper(idx, dim - 1).unsqueeze(dim - 1)
+
+            idx = torch.randint(0, dim_size, (input.shape[1],))
+            idx = unsqueeze_helper(idx, len(input_size))
+            expanded_shape[0] = 1
+            idx = idx.expand(expanded_shape)
+            idx2 = idx.contiguous()
+            out = torch.gather(input, 0, idx)
+            out2 = torch.gather(input2, 0, idx2)
             self.assertEqual(out, out2)
 
         helper([50, 17], 100)

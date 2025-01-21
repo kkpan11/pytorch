@@ -3,6 +3,7 @@ import os
 import re
 import sys
 
+
 # This script takes the logs produced by the benchmark scripts (e.g.,
 # torchbench.py) and parses it into a CSV file that summarizes what
 # is failing and why.  It is kept separate from the benchmark script
@@ -15,7 +16,7 @@ import sys
 
 assert len(sys.argv) == 2
 
-full_log = open(sys.argv[1], "r").read()
+full_log = open(sys.argv[1]).read()
 
 # If the log contains a gist URL, extract it so we can include it in the CSV
 gist_url = ""

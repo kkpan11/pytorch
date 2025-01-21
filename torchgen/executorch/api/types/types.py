@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict
 
 from torchgen.api.types import (
     BaseCppType,
@@ -15,6 +16,7 @@ from torchgen.api.types import (
 )
 from torchgen.model import BaseTy
 
+
 halfT = BaseCppType("torch::executor", "Half")
 bfloat16T = BaseCppType("torch::executor", "BFloat16")
 stringT = BaseCppType("torch::executor", "string_view")
@@ -25,7 +27,7 @@ scalarT = BaseCppType("torch::executor", "Scalar")
 memoryFormatT = BaseCppType("torch::executor", "MemoryFormat")
 intArrayRefT = BaseCppType("torch::executor", "IntArrayRef")
 optionalT = BaseCppType("torch::executor", "optional")
-contextT = BaseCppType("torch::executor", "RuntimeContext")
+contextT = BaseCppType("torch::executor", "KernelRuntimeContext")
 
 contextExpr = Expr(
     expr="context",
@@ -39,7 +41,7 @@ contextArg = Binding(
     default=None,
 )
 
-BaseTypeToCppMapping: Dict[BaseTy, BaseCppType] = {
+BaseTypeToCppMapping: dict[BaseTy, BaseCppType] = {
     BaseTy.int: longT,
     BaseTy.float: doubleT,
     BaseTy.bool: boolT,
@@ -53,29 +55,23 @@ BaseTypeToCppMapping: Dict[BaseTy, BaseCppType] = {
 
 @dataclass(frozen=True)
 class OptionalCType(CType):
-    elem: "CType"
+    elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
         # Do not pass `strip_ref` recursively.
         return f"torch::executor::optional<{self.elem.cpp_type()}>"
 
-    def cpp_type_registration_declarations(self) -> str:
-        return f"torch::executor::optional<{self.elem.cpp_type_registration_declarations()}>"
-
-    def remove_const_ref(self) -> "CType":
+    def remove_const_ref(self) -> CType:
         return OptionalCType(self.elem.remove_const_ref())
 
 
 @dataclass(frozen=True)
 class ArrayRefCType(CType):
-    elem: "CType"
+    elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
         # Do not pass `strip_ref` recursively.
         return f"torch::executor::ArrayRef<{self.elem.cpp_type()}>"
 
-    def cpp_type_registration_declarations(self) -> str:
-        return f"torch::executor::ArrayRef<{self.elem.cpp_type_registration_declarations()}>"
-
-    def remove_const_ref(self) -> "CType":
+    def remove_const_ref(self) -> CType:
         return ArrayRefCType(self.elem.remove_const_ref())

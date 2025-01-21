@@ -1,11 +1,15 @@
+# mypy: allow-untyped-defs
 from numbers import Number
 
 import torch
+from torch import Tensor
 from torch.distributions import constraints
 from torch.distributions.exp_family import ExponentialFamily
 from torch.distributions.utils import broadcast_all
 
-__all__ = ['Poisson']
+
+__all__ = ["Poisson"]
+
 
 class Poisson(ExponentialFamily):
     r"""
@@ -26,23 +30,23 @@ class Poisson(ExponentialFamily):
     Args:
         rate (Number, Tensor): the rate parameter
     """
-    arg_constraints = {'rate': constraints.nonnegative}
+    arg_constraints = {"rate": constraints.nonnegative}
     support = constraints.nonnegative_integer
 
     @property
-    def mean(self):
+    def mean(self) -> Tensor:
         return self.rate
 
     @property
-    def mode(self):
+    def mode(self) -> Tensor:
         return self.rate.floor()
 
     @property
-    def variance(self):
+    def variance(self) -> Tensor:
         return self.rate
 
     def __init__(self, rate, validate_args=None):
-        self.rate, = broadcast_all(rate)
+        (self.rate,) = broadcast_all(rate)
         if isinstance(rate, Number):
             batch_shape = torch.Size()
         else:
@@ -69,8 +73,8 @@ class Poisson(ExponentialFamily):
         return value.xlogy(rate) - rate - (value + 1).lgamma()
 
     @property
-    def _natural_params(self):
-        return (torch.log(self.rate), )
+    def _natural_params(self) -> tuple[Tensor]:
+        return (torch.log(self.rate),)
 
     def _log_normalizer(self, x):
         return torch.exp(x)

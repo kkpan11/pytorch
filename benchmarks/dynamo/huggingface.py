@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import importlib
 import logging
 import os
@@ -7,13 +8,38 @@ import subprocess
 import sys
 import warnings
 
-import torch
-from common import BenchmarkRunner, download_retry_decorator, main, reset_rng_state
 
+try:
+    from .common import (
+        BenchmarkRunner,
+        download_retry_decorator,
+        load_yaml_file,
+        main,
+        reset_rng_state,
+    )
+except ImportError:
+    from common import (
+        BenchmarkRunner,
+        download_retry_decorator,
+        load_yaml_file,
+        main,
+        reset_rng_state,
+    )
+
+import torch
 from torch._dynamo.testing import collect_results
 from torch._dynamo.utils import clone_inputs
 
+
 log = logging.getLogger(__name__)
+
+# Enable FX graph caching
+if "TORCHINDUCTOR_FX_GRAPH_CACHE" not in os.environ:
+    torch._inductor.config.fx_graph_cache = True
+
+# Enable Autograd caching
+if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
+    torch._functorch.config.enable_autograd_cache = True
 
 
 def pip_install(package):
@@ -55,6 +81,12 @@ imports = [
 ]
 
 
+def process_hf_reformer_output(out):
+    assert isinstance(out, list)
+    # second output is unstable
+    return [elem for i, elem in enumerate(out) if i != 1]
+
+
 try:
     mod = importlib.import_module("transformers")
     for cls in imports:
@@ -72,9 +104,10 @@ finally:
 # combination of models supported by HF Fx parser and some manually supplied
 # models. For these models, we already know the largest batch size that can fit
 # on A100 GPUs - 40 GB.
-BATCH_SIZE_KNOWN_MODELS = dict()
+BATCH_SIZE_KNOWN_MODELS = {}
 
 
+# TODO(sdym): use batch-size-file parameter of common.main, like torchbench.py
 # Get the list of models and their batch sizes
 MODELS_FILENAME = os.path.join(os.path.dirname(__file__), "huggingface_models_list.txt")
 assert os.path.exists(MODELS_FILENAME)
@@ -86,94 +119,6 @@ with open(MODELS_FILENAME, "r") as fh:
         batch_size = int(batch_size)
         BATCH_SIZE_KNOWN_MODELS[model_name] = batch_size
 assert len(BATCH_SIZE_KNOWN_MODELS)
-
-
-SKIP = {
-    # Difficult to setup accuracy test because .eval() not supported
-    "Reformer",
-    # Fails deepcopy
-    "BlenderbotForConditionalGeneration",
-    "GPTNeoForCausalLM",
-    "GPTNeoForSequenceClassification",
-    # Fails with even batch size = 1
-    "GPTJForCausalLM",
-    "GPTJForQuestionAnswering",
-}
-
-# TODO - Fails even after fake tensors
-BATCH_SIZE_DIVISORS = {
-    "AlbertForMaskedLM": 2,
-    "AlbertForQuestionAnswering": 2,
-    "AllenaiLongformerBase": 2,
-    "BartForCausalLM": 2,
-    "BartForConditionalGeneration": 2,
-    "BertForMaskedLM": 2,
-    "BertForQuestionAnswering": 2,
-    "BlenderbotForCausalLM": 8,
-    # "BlenderbotForConditionalGeneration" : 16,
-    "BlenderbotSmallForCausalLM": 4,
-    "BlenderbotSmallForConditionalGeneration": 2,
-    "CamemBert": 2,
-    "DebertaForMaskedLM": 4,
-    "DebertaForQuestionAnswering": 2,
-    "DebertaV2ForMaskedLM": 4,
-    "DebertaV2ForQuestionAnswering": 8,
-    "DistilBertForMaskedLM": 2,
-    "DistilBertForQuestionAnswering": 2,
-    "DistillGPT2": 2,
-    "ElectraForCausalLM": 2,
-    "ElectraForQuestionAnswering": 2,
-    "GPT2ForSequenceClassification": 2,
-    # "GPTJForCausalLM" : 2,
-    # "GPTJForQuestionAnswering" : 2,
-    # "GPTNeoForCausalLM" : 32,
-    # "GPTNeoForSequenceClassification" : 2,
-    "GoogleFnet": 2,
-    "LayoutLMForMaskedLM": 2,
-    "LayoutLMForSequenceClassification": 2,
-    "M2M100ForConditionalGeneration": 4,
-    "MBartForCausalLM": 2,
-    "MBartForConditionalGeneration": 2,
-    "MT5ForConditionalGeneration": 2,
-    "MegatronBertForCausalLM": 4,
-    "MegatronBertForQuestionAnswering": 2,
-    "MobileBertForMaskedLM": 2,
-    "MobileBertForQuestionAnswering": 2,
-    "OPTForCausalLM": 2,
-    "PLBartForCausalLM": 2,
-    "PLBartForConditionalGeneration": 2,
-    "PegasusForCausalLM": 4,
-    "PegasusForConditionalGeneration": 2,
-    "RobertaForCausalLM": 2,
-    "RobertaForQuestionAnswering": 2,
-    "Speech2Text2ForCausalLM": 4,
-    "T5ForConditionalGeneration": 2,
-    "T5Small": 2,
-    "TrOCRForCausalLM": 2,
-    "XGLMForCausalLM": 4,
-    "XLNetLMHeadModel": 2,
-    "YituTechConvBert": 2,
-}
-
-SKIP_ACCURACY_CHECK_MODELS = {
-    # Models too large to have eager, dynamo and fp64_numbers simultaneosuly
-    # even for 40 GB machine.
-    "DebertaV2ForMaskedLM",
-    "BlenderbotForCausalLM",
-}
-
-
-REQUIRE_HIGHER_TOLERANCE = {
-    "MT5ForConditionalGeneration",
-    # AlbertForQuestionAnswering fails in CI GCP A100 but error does not seem
-    # harmful.
-    "AlbertForQuestionAnswering",
-}
-
-
-SKIP_FOR_CPU = {
-    "OPTForCausalLM",  # OOMs
-}
 
 
 def get_module_cls_by_model_name(model_cls_name):
@@ -214,6 +159,11 @@ def get_sequence_length(model_cls, model_name):
         seq_length = 256
     elif model_name.startswith("MobileBert"):
         seq_length = 128
+    elif model_name.startswith("Wav2Vec2"):
+        # If too short, will fail with something like
+        # ValueError: `mask_length` has to be smaller than `sequence_length`,
+        # but got `mask_length`: 10 and `sequence_length`: 9`
+        seq_length = 10000  # NB: a more realistic size is 155136
     else:
         log.info(
             f"Sequence Length not defined for {model_name}. Choosing 128 arbitrarily"
@@ -230,6 +180,18 @@ def generate_inputs_for_model(
     num_visual_features = 42
     seq_length = get_sequence_length(model_cls, model_name)
     vocab_size = model.config.vocab_size
+
+    if model_name.startswith("Wav2Vec2"):
+        # TODO: If we add more input_values style models, try to work this
+        # into the overall control flow
+        target_length = 100
+        return {
+            "input_values": torch.randn((bs, seq_length), device=device),
+            # Added because that's what the example training script has
+            "attention_mask": rand_int_tensor(device, 0, 2, (bs, seq_length)),
+            "labels": rand_int_tensor(device, 0, vocab_size, (bs, target_length)),
+        }
+
     if model_name.endswith("MultipleChoice"):
         input = rand_int_tensor(device, 0, vocab_size, (bs, num_choices, seq_length))
     elif model_name.startswith("Roberta"):
@@ -379,8 +341,32 @@ class HuggingfaceRunner(BenchmarkRunner):
         self.suite_name = "huggingface"
 
     @property
+    def _config(self):
+        return load_yaml_file("huggingface.yaml")
+
+    @property
+    def _skip(self):
+        return self._config["skip"]
+
+    @property
+    def _accuracy(self):
+        return self._config["accuracy"]
+
+    @property
+    def skip_models(self):
+        return self._skip["all"]
+
+    @property
     def skip_models_for_cpu(self):
-        return SKIP_FOR_CPU
+        return self._skip["device"]["cpu"]
+
+    @property
+    def fp32_only_models(self):
+        return self._config["only_fp32"]
+
+    @property
+    def skip_models_due_to_control_flow(self):
+        return self._skip["control_flow"]
 
     def _get_model_cls_and_config(self, model_name):
         if model_name not in EXTRA_MODELS:
@@ -421,6 +407,7 @@ class HuggingfaceRunner(BenchmarkRunner):
         device,
         model_name,
         batch_size=None,
+        extra_args=None,
     ):
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
@@ -429,6 +416,8 @@ class HuggingfaceRunner(BenchmarkRunner):
         model_cls, config = self._get_model_cls_and_config(model_name)
         model = self._download_model(model_name)
         model = model.to(device, dtype=dtype)
+        if self.args.enable_activation_checkpointing:
+            model.gradient_checkpointing_enable()
         if model_name in BATCH_SIZE_KNOWN_MODELS:
             batch_size_default = BATCH_SIZE_KNOWN_MODELS[model_name]
         elif batch_size is None:
@@ -439,8 +428,9 @@ class HuggingfaceRunner(BenchmarkRunner):
 
         if batch_size is None:
             batch_size = batch_size_default
-            if model_name in BATCH_SIZE_DIVISORS:
-                batch_size = max(int(batch_size / BATCH_SIZE_DIVISORS[model_name]), 1)
+            batch_size_divisors = self._config["batch_size"]["divisors"]
+            if model_name in batch_size_divisors:
+                batch_size = max(int(batch_size / batch_size_divisors[model_name]), 1)
                 log.info(
                     f"Running smaller batch size={batch_size} for {model_name}, orig batch_size={batch_size_default}"
                 )
@@ -454,7 +444,13 @@ class HuggingfaceRunner(BenchmarkRunner):
             if "drop" in attr and isinstance(getattr(config, attr), float):
                 setattr(config, attr, 1e-30)
 
-        if is_training and not use_eval_mode:
+        if (
+            is_training
+            and not use_eval_mode
+            and not (
+                self.args.accuracy and model_name in self._config["only_inference"]
+            )
+        ):
             model.train()
         else:
             model.eval()
@@ -475,7 +471,7 @@ class HuggingfaceRunner(BenchmarkRunner):
                 not re.search("|".join(args.filter), model_name, re.I)
                 or re.search("|".join(args.exclude), model_name, re.I)
                 or model_name in args.exclude_exact
-                or model_name in SKIP
+                or model_name in self.skip_models
             ):
                 continue
             yield model_name
@@ -483,8 +479,12 @@ class HuggingfaceRunner(BenchmarkRunner):
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
         if self.args.dashboard or self.args.accuracy:
-            return SKIP_ACCURACY_CHECK_MODELS
+            return self._accuracy["skip"]["large_models"]
         return set()
+
+    @property
+    def get_output_amp_train_process_func(self):
+        return {}
 
     def pick_grad(self, name, is_training):
         if is_training:
@@ -495,23 +495,36 @@ class HuggingfaceRunner(BenchmarkRunner):
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         cosine = self.args.cosine
         if is_training:
-            if name in REQUIRE_HIGHER_TOLERANCE:
+            from torch._inductor import config as inductor_config
+
+            if (name in self._config["tolerance"]["higher_training"]) or (
+                inductor_config.max_autotune
+                and name in self._config["tolerance"]["higher_max_autotune_training"]
+            ):
                 return 2e-2, cosine
             else:
                 return 1e-2, cosine
+        else:
+            if (
+                current_device == "cpu"
+                and name in self._config["tolerance"]["higher_inference_cpu"]
+            ):
+                return 5e-3, cosine
+            if name in self._config["tolerance"]["higher_inference"]:
+                return 4e-3, cosine
         return 1e-3, cosine
 
     def compute_loss(self, pred):
         return pred[0]
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
-        with self.autocast():
+        with self.autocast(**self.autocast_arg):
             return mod(**inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
-        with self.autocast():
+        with self.autocast(**self.autocast_arg):
             pred = mod(**cloned_inputs)
             loss = self.compute_loss(pred)
         self.grad_scaler.scale(loss).backward()
@@ -533,7 +546,7 @@ def refresh_model_names_and_batch_sizes():
     """
     import transformers.utils.fx as hf_fx
 
-    family = dict()
+    family = {}
     lm_seen = set()
     family_seen = set()
     for cls_name in hf_fx._SUPPORTED_MODELS:

@@ -9,8 +9,7 @@
 #include <ATen/functorch/Macros.h>
 #include <ATen/functorch/BatchedTensorImpl.h>
 
-namespace at {
-namespace functorch {
+namespace at::functorch {
 
 // This files contains the legacy (now-deprecated) batching rule API.
 // Please try to use the new-style batching rule API (see writing_batch_rules.md)
@@ -121,7 +120,7 @@ struct VmapPhysicalToLogicalMap;
 //   levels: 012345
 struct TORCH_API VmapPhysicalView {
   VmapPhysicalView(Tensor&& tensor, std::bitset<kVmapNumLevels> levels)
-      : levels_(levels), tensor_(tensor) {
+      : levels_(levels), tensor_(std::move(tensor)) {
     // TORCH_INTERNAL_ASSERT(!isBatchedTensor(tensor));
   }
 
@@ -185,5 +184,4 @@ struct TORCH_API VmapPhysicalToLogicalMap {
 };
 
 
-}
-} // namespace at
+} // namespace at::functorch

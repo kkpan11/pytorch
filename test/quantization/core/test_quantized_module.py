@@ -151,40 +151,42 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         model_dict = qlinear.state_dict()
         b = io.BytesIO()
         torch.save(model_dict, b)
-        b.seek(0)
-        loaded_dict = torch.load(b)
-        for key in model_dict:
-            if isinstance(model_dict[key], torch._C.ScriptObject):
-                assert isinstance(loaded_dict[key], torch._C.ScriptObject)
-                w_model, b_model = torch.ops.quantized.linear_unpack(model_dict[key])
-                w_loaded, b_loaded = torch.ops.quantized.linear_unpack(loaded_dict[key])
-                self.assertEqual(w_model, w_loaded)
-                self.assertEqual(b_model, b_loaded)
-            else:
-                self.assertEqual(model_dict[key], loaded_dict[key])
+        for weights_only in [True, False]:
+            b.seek(0)
+            loaded_dict = torch.load(b, weights_only=weights_only)
+            for key in model_dict:
+                if isinstance(model_dict[key], torch._C.ScriptObject):
+                    assert isinstance(loaded_dict[key], torch._C.ScriptObject)
+                    w_model, b_model = torch.ops.quantized.linear_unpack(model_dict[key])
+                    w_loaded, b_loaded = torch.ops.quantized.linear_unpack(loaded_dict[key])
+                    self.assertEqual(w_model, w_loaded)
+                    self.assertEqual(b_model, b_loaded)
+                else:
+                    self.assertEqual(model_dict[key], loaded_dict[key])
 
-        loaded_qlinear = qlinear_module(
-            in_features, out_features, **post_ops_kwargs)
-        loaded_qlinear.load_state_dict(loaded_dict)
-        linear_unpack = torch.ops.quantized.linear_unpack
-        self.assertEqual(linear_unpack(qlinear._packed_params._packed_params),
-                         linear_unpack(loaded_qlinear._packed_params._packed_params))
-        self.assertEqual(qlinear.scale, loaded_qlinear.scale)
-        self.assertEqual(qlinear.zero_point, loaded_qlinear.zero_point)
-        # scripting will add __overloads__ to __dict__, which is why we script a copy
-        # to be able to do the check in the next line
-        self.checkScriptable(copy.deepcopy(loaded_qlinear), [[X_q]], check_save_load=True)
-        self.assertTrue(dir(qlinear) == dir(loaded_qlinear))
-        self.assertEqual(qlinear._weight_bias(), loaded_qlinear._weight_bias())
-        self.assertEqual(qlinear._weight_bias(), torch.ops.quantized.linear_unpack(qlinear._packed_params._packed_params))
-        Z_q2 = loaded_qlinear(X_q)
-        self.assertEqual(Z_q, Z_q2)
+            loaded_qlinear = qlinear_module(
+                in_features, out_features, **post_ops_kwargs)
+            loaded_qlinear.load_state_dict(loaded_dict)
+            linear_unpack = torch.ops.quantized.linear_unpack
+            self.assertEqual(linear_unpack(qlinear._packed_params._packed_params),
+                             linear_unpack(loaded_qlinear._packed_params._packed_params))
+            self.assertEqual(qlinear.scale, loaded_qlinear.scale)
+            self.assertEqual(qlinear.zero_point, loaded_qlinear.zero_point)
+            # scripting will add __overloads__ to __dict__, which is why we script a copy
+            # to be able to do the check in the next line
+            self.checkScriptable(copy.deepcopy(loaded_qlinear), [[X_q]], check_save_load=True)
+            self.assertTrue(dir(qlinear) == dir(loaded_qlinear))
+            self.assertEqual(qlinear._weight_bias(), loaded_qlinear._weight_bias())
+            self.assertEqual(qlinear._weight_bias(), torch.ops.quantized.linear_unpack(qlinear._packed_params._packed_params))
+            Z_q2 = loaded_qlinear(X_q)
+            self.assertEqual(Z_q, Z_q2)
 
         # Test serialization
         b = io.BytesIO()
         torch.save(qlinear, b)
         b.seek(0)
-        loaded = torch.load(b)
+        # weights_only=False as this is legacy code that saves the model
+        loaded = torch.load(b, weights_only=False)
         self.assertEqual(qlinear.weight(), loaded.weight())
         self.assertEqual(qlinear.scale, loaded.scale)
         self.assertEqual(qlinear.zero_point, loaded.zero_point)
@@ -201,7 +203,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.assertEqual(qlinear.scale, loaded_from_package.scale)
         self.assertEqual(qlinear.zero_point, loaded_from_package.zero_point)
 
-        for name, module in loaded_from_package.named_modules():
+        for name, _ in loaded_from_package.named_modules():
             # noop, just make sure attribute "_modules" is restored correctly during torch.package import
             assert(name is not None)  # noqa: E275
 
@@ -337,35 +339,37 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             self.assertEqual(model_dict['bias'], b)
         bytes_io = io.BytesIO()
         torch.save(model_dict, bytes_io)
-        bytes_io.seek(0)
-        loaded_dict = torch.load(bytes_io)
-        for key in loaded_dict:
-            self.assertEqual(model_dict[key], loaded_dict[key])
-        loaded_qconv_module = type(qconv_module)(
-            in_channels, out_channels, kernel_size, stride, padding, dilation,
-            groups, use_bias, padding_mode=padding_mode)
-        loaded_qconv_module.load_state_dict(loaded_dict)
+        for weights_only in [True, False]:
+            bytes_io.seek(0)
+            loaded_dict = torch.load(bytes_io, weights_only=weights_only)
+            for key in loaded_dict:
+                self.assertEqual(model_dict[key], loaded_dict[key])
+            loaded_qconv_module = type(qconv_module)(
+                in_channels, out_channels, kernel_size, stride, padding, dilation,
+                groups, use_bias, padding_mode=padding_mode)
+            loaded_qconv_module.load_state_dict(loaded_dict)
 
-        self.assertTrue(dir(loaded_qconv_module) == dir(qconv_module))
-        self.assertTrue(module_name == loaded_qconv_module._get_name())
-        self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
-        self.assertTrue(hasattr(loaded_qconv_module, '_weight_bias'))
+            self.assertTrue(dir(loaded_qconv_module) == dir(qconv_module))
+            self.assertTrue(module_name == loaded_qconv_module._get_name())
+            self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
+            self.assertTrue(hasattr(loaded_qconv_module, '_weight_bias'))
 
-        self.assertEqual(qconv_module.weight(), loaded_qconv_module.weight())
-        if use_bias:
-            self.assertEqual(qconv_module.bias(), loaded_qconv_module.bias())
-        self.assertEqual(qconv_module.scale, loaded_qconv_module.scale)
-        self.assertEqual(qconv_module.zero_point,
-                         loaded_qconv_module.zero_point)
-        Y_loaded = loaded_qconv_module(*example_input_q)
-        np.testing.assert_array_almost_equal(
-            Y_exp.int_repr().numpy(), Y_loaded.int_repr().numpy(), decimal=0)
+            self.assertEqual(qconv_module.weight(), loaded_qconv_module.weight())
+            if use_bias:
+                self.assertEqual(qconv_module.bias(), loaded_qconv_module.bias())
+            self.assertEqual(qconv_module.scale, loaded_qconv_module.scale)
+            self.assertEqual(qconv_module.zero_point,
+                             loaded_qconv_module.zero_point)
+            Y_loaded = loaded_qconv_module(*example_input_q)
+            np.testing.assert_array_almost_equal(
+                Y_exp.int_repr().numpy(), Y_loaded.int_repr().numpy(), decimal=0)
 
         # Test serialization
         b = io.BytesIO()
         torch.save(qconv_module, b)
         b.seek(0)
-        loaded_conv = torch.load(b)
+        # weights_only=False as this is legacy code that saves the model
+        loaded_conv = torch.load(b, weights_only=False)
 
         self.assertEqual(loaded_conv.bias(), qconv_module.bias())
         self.assertEqual(loaded_conv.scale, qconv_module.scale)
@@ -1073,8 +1077,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         qY = quant_mod(qX)
 
         self.assertEqual(qY_ref.int_repr().numpy(), qY.int_repr().numpy(),
-                         msg="LayerNorm module API failed, qY_ref\n{} vs qY\n{}"
-                         .format(qY_ref, qY))
+                         msg=f"LayerNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def test_group_norm(self):
         """Tests the correctness of the groupnorm module.
@@ -1104,8 +1107,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         qY = quant_mod(qX)
 
         self.assertEqual(qY_ref.int_repr().numpy(), qY.int_repr().numpy(),
-                         msg="GroupNorm module API failed, qY_ref\n{} vs qY\n{}"
-                         .format(qY_ref, qY))
+                         msg=f"GroupNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def test_instance_norm(self):
         """Tests the correctness of the instancenorm{n}d modules.
@@ -1145,8 +1147,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
             self.assertEqual(
                 qY_ref.int_repr().numpy(), qY.int_repr().numpy(),
-                msg="InstanceNorm module API failed, qY_ref\n{} vs qY\n{}"
-                .format(qY_ref, qY))
+                msg=f"InstanceNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def _test_activation_module_impl(self, name, float_module_class, quantized_module_class, extra_kwargs):
         """Tests the correctness of the ELU module.
@@ -1156,7 +1157,6 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         x_zero_point = 0
         y_scale = 5.0 / 256
         y_zero_point = 127
-        alpha = 1.5
 
         dims = (1, 4, 8)
 
@@ -1173,8 +1173,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         quant_mod = quantized_module_class(y_scale, y_zero_point, **extra_kwargs)
         qY = quant_mod(qX)
         self.assertEqual(qY_ref.int_repr().numpy(), qY.int_repr().numpy(),
-                         msg="{} module API failed, qY_ref\n{} vs qY\n{}"
-                         .format(name, qY_ref, qY))
+                         msg=f"{name} module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def _test_leaky_relu_serialization(self):
         scale_original = 10.0 / 256
@@ -1314,29 +1313,38 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                                              offsets, set_qconfig, is_emb_bag=True, dtype=qdtype)
 
     def test_prelu(self):
-        x = torch.randn((4, 4, 4, 4), dtype=torch.float)
-        qx = torch.quantize_per_tensor(x, 1.0, 0, dtype=torch.quint8)
+        for num_parameters in range(1, 10):
+            x = torch.randn(4, num_parameters, 4)
+            qx = torch.quantize_per_tensor_dynamic(x, dtype=torch.quint8, reduce_range=False)
 
-        # num_parameters = 1
-        prelu_module = nnq.PReLU(output_scale=1.0, output_zero_point=0, num_parameters=1)
-        w = torch.randn(1, dtype=torch.float)
-        qw = torch.quantize_per_tensor(w, 1.0, 0, dtype=torch.quint8)
-        prelu_module.set_weight(qw)
-        qy = prelu_module(qx)
-        qy_ref = torch.prelu(qx, qw)
 
-        self.assertEqual(qy_ref, qy,
-                         msg="PReLU module API failed")
+            f_prelu = torch.nn.PReLU(num_parameters=num_parameters)
+            f_prelu.weight = torch.nn.Parameter(torch.randn(num_parameters).abs())
+            f_prelu.qconfig = torch.ao.quantization.QConfig(
+                activation=torch.ao.quantization.default_observer,
+                weight=torch.ao.quantization.default_observer,)
+            f_prelu.activation_post_process = f_prelu.qconfig.activation()
+            f_prelu.activation_post_process(f_prelu(x))
+            q_prelu = nnq.PReLU.from_float(f_prelu)
+            w_obs = f_prelu.qconfig.weight()
+            w_obs(f_prelu.weight)
+            w_scale, w_zp = w_obs.calculate_qparams()
+            q_prelu_weight = torch.quantize_per_tensor(
+                f_prelu.weight,
+                dtype=torch.quint8,
+                scale=w_scale,
+                zero_point=w_zp
+            ).dequantize()
 
-        # num_parameters = num_channels
-        prelu_module = nnq.PReLU(output_scale=1.0, output_zero_point=0, num_parameters=4)
-        w = torch.randn(4, dtype=torch.float)
-        qw = torch.quantize_per_tensor(w, 1.0, 0, dtype=torch.quint8)
-        prelu_module.set_weight(qw)
-        qy = prelu_module(qx)
-        qy_ref = torch.prelu(qx, qw)
-        self.assertEqual(qy_ref, qy,
-                         msg="PReLU module API failed")
+            # check that the weight makes sense
+            self.assertEqual(q_prelu.weight.dequantize(), q_prelu_weight)
+            f_prelu.weight = torch.nn.Parameter(q_prelu.weight.dequantize())
+            qy = q_prelu(qx)
+            qy_ref = torch.quantize_per_tensor(
+                f_prelu(qx.dequantize()), q_prelu.scale, q_prelu.zero_point, dtype=torch.quint8
+            )
+            # check that the output makes sense
+            self.assertEqual(qy, qy_ref, atol=.1, rtol=.1)
 
     def test_channel_shuffle(self):
         """Tests the correctness of the ChannelShuffle module.
@@ -1362,8 +1370,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         qY = quant_mod(qX)
 
         self.assertEqual(qY_ref.int_repr().numpy(), qY.int_repr().numpy(),
-                         msg="ChannelShuffle module API failed, qY_ref\n{} vs qY\n{}"
-                         .format(qY_ref, qY))
+                         msg=f"ChannelShuffle module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     @skipIfNoONEDNN
     def test_linear_leaky_relu(self):
@@ -1445,35 +1452,37 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
         self.assertEqual(model_dict['bias'], b)
         bytes_io = io.BytesIO()
         torch.save(model_dict, bytes_io)
-        bytes_io.seek(0)
-        loaded_dict = torch.load(bytes_io)
-        for key in loaded_dict:
-            self.assertEqual(model_dict[key], loaded_dict[key])
-        loaded_qconv_module = type(dynamic_module)(
-            in_channels, out_channels, kernel_size, stride=stride, padding=padding,
-            dilation=dilation, groups=groups, bias=bias, padding_mode=padding_mode)
-        loaded_qconv_module.load_state_dict(loaded_dict)
+        for weights_only in [True, False]:
+            bytes_io.seek(0)
+            loaded_dict = torch.load(bytes_io, weights_only=weights_only)
+            for key in loaded_dict:
+                self.assertEqual(model_dict[key], loaded_dict[key])
+            loaded_qconv_module = type(dynamic_module)(
+                in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                dilation=dilation, groups=groups, bias=bias, padding_mode=padding_mode)
+            loaded_qconv_module.load_state_dict(loaded_dict)
 
-        self.assertTrue(dir(loaded_qconv_module) == dir(dynamic_module))
-        self.assertTrue(dynamic_module._get_name() == loaded_qconv_module._get_name())
-        self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
-        self.assertTrue(hasattr(loaded_qconv_module, '_weight_bias'))
+            self.assertTrue(dir(loaded_qconv_module) == dir(dynamic_module))
+            self.assertTrue(dynamic_module._get_name() == loaded_qconv_module._get_name())
+            self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
+            self.assertTrue(hasattr(loaded_qconv_module, '_weight_bias'))
 
-        self.assertEqual(dynamic_module.weight(), loaded_qconv_module.weight())
-        if bias:
-            self.assertEqual(dynamic_module.bias(), loaded_qconv_module.bias())
-        self.assertEqual(dynamic_module.scale, loaded_qconv_module.scale)
-        self.assertEqual(dynamic_module.zero_point,
-                         loaded_qconv_module.zero_point)
-        Y_loaded = loaded_qconv_module(X_fp32, reduce_range)
-        np.testing.assert_array_almost_equal(
-            Y.numpy(), Y_loaded.numpy(), decimal=0)
+            self.assertEqual(dynamic_module.weight(), loaded_qconv_module.weight())
+            if bias:
+                self.assertEqual(dynamic_module.bias(), loaded_qconv_module.bias())
+            self.assertEqual(dynamic_module.scale, loaded_qconv_module.scale)
+            self.assertEqual(dynamic_module.zero_point,
+                             loaded_qconv_module.zero_point)
+            Y_loaded = loaded_qconv_module(X_fp32, reduce_range)
+            np.testing.assert_array_almost_equal(
+                Y.numpy(), Y_loaded.numpy(), decimal=0)
 
         # Test serialization
         b = io.BytesIO()
         torch.save(dynamic_module, b)
         b.seek(0)
-        loaded_conv = torch.load(b)
+        # weights_only=False as this is legacy code that saves the model
+        loaded_conv = torch.load(b, weights_only=False)
 
         self.assertEqual(loaded_conv.bias(), dynamic_module.bias())
         self.assertEqual(loaded_conv.scale, dynamic_module.scale)
@@ -1618,40 +1627,42 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
         model_dict = qlinear.state_dict()
         b = io.BytesIO()
         torch.save(model_dict, b)
-        b.seek(0)
-        loaded_dict = torch.load(b)
-        for key in model_dict:
-            if isinstance(model_dict[key], torch._C.ScriptObject):
-                assert isinstance(loaded_dict[key], torch._C.ScriptObject)
-                w_model, b_model = torch.ops.quantized.linear_unpack(model_dict[key])
-                w_loaded, b_loaded = torch.ops.quantized.linear_unpack(loaded_dict[key])
-                self.assertEqual(w_model, w_loaded)
-                self.assertEqual(b_model, b_loaded)
-            else:
-                self.assertEqual(model_dict[key], loaded_dict[key])
-        loaded_qlinear = nnqd.Linear(in_features, out_features)
-        loaded_qlinear.load_state_dict(loaded_dict)
+        for weights_only in [True, False]:
+            b.seek(0)
+            loaded_dict = torch.load(b, weights_only=weights_only)
+            for key in model_dict:
+                if isinstance(model_dict[key], torch._C.ScriptObject):
+                    assert isinstance(loaded_dict[key], torch._C.ScriptObject)
+                    w_model, b_model = torch.ops.quantized.linear_unpack(model_dict[key])
+                    w_loaded, b_loaded = torch.ops.quantized.linear_unpack(loaded_dict[key])
+                    self.assertEqual(w_model, w_loaded)
+                    self.assertEqual(b_model, b_loaded)
+                else:
+                    self.assertEqual(model_dict[key], loaded_dict[key])
+            loaded_qlinear = nnqd.Linear(in_features, out_features)
+            loaded_qlinear.load_state_dict(loaded_dict)
 
-        linear_unpack = torch.ops.quantized.linear_unpack
-        self.assertEqual(linear_unpack(qlinear._packed_params._packed_params),
-                         linear_unpack(loaded_qlinear._packed_params._packed_params))
-        if use_bias:
-            self.assertEqual(qlinear.bias(), loaded_qlinear.bias())
-        self.assertTrue(dir(qlinear) == dir(loaded_qlinear))
-        self.assertTrue(hasattr(qlinear, '_packed_params'))
-        self.assertTrue(hasattr(loaded_qlinear, '_packed_params'))
-        self.assertTrue(hasattr(qlinear, '_weight_bias'))
-        self.assertTrue(hasattr(loaded_qlinear, '_weight_bias'))
+            linear_unpack = torch.ops.quantized.linear_unpack
+            self.assertEqual(linear_unpack(qlinear._packed_params._packed_params),
+                             linear_unpack(loaded_qlinear._packed_params._packed_params))
+            if use_bias:
+                self.assertEqual(qlinear.bias(), loaded_qlinear.bias())
+            self.assertTrue(dir(qlinear) == dir(loaded_qlinear))
+            self.assertTrue(hasattr(qlinear, '_packed_params'))
+            self.assertTrue(hasattr(loaded_qlinear, '_packed_params'))
+            self.assertTrue(hasattr(qlinear, '_weight_bias'))
+            self.assertTrue(hasattr(loaded_qlinear, '_weight_bias'))
 
-        self.assertEqual(qlinear._weight_bias(), loaded_qlinear._weight_bias())
-        self.assertEqual(qlinear._weight_bias(), torch.ops.quantized.linear_unpack(qlinear._packed_params._packed_params))
-        Z_dq2 = qlinear(X)
-        self.assertEqual(Z_dq, Z_dq2)
+            self.assertEqual(qlinear._weight_bias(), loaded_qlinear._weight_bias())
+            self.assertEqual(qlinear._weight_bias(), torch.ops.quantized.linear_unpack(qlinear._packed_params._packed_params))
+            Z_dq2 = qlinear(X)
+            self.assertEqual(Z_dq, Z_dq2)
 
         b = io.BytesIO()
         torch.save(qlinear, b)
         b.seek(0)
-        loaded = torch.load(b)
+        # weights_only=False as this is legacy code that saves the model
+        loaded = torch.load(b, weights_only=False)
         self.assertEqual(qlinear.weight(), loaded.weight())
         self.assertEqual(qlinear.zero_point, loaded.zero_point)
 
@@ -1696,12 +1707,12 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
         for layer in range(num_layers):
             for direction in range(num_directions):
                 suffix = '_reverse' if direction == 1 else ''
-                key_name1 = 'weight_ih_l{layer_idx}{suffix}'.format(layer_idx=layer, suffix=suffix)
-                key_name2 = 'weight_hh_l{layer_idx}{suffix}'.format(layer_idx=layer, suffix=suffix)
+                key_name1 = f'weight_ih_l{layer}{suffix}'
+                key_name2 = f'weight_hh_l{layer}{suffix}'
                 weight_keys.append(key_name1)
                 weight_keys.append(key_name2)
-                key_name1 = 'bias_ih_l{layer_idx}{suffix}'.format(layer_idx=layer, suffix=suffix)
-                key_name2 = 'bias_hh_l{layer_idx}{suffix}'.format(layer_idx=layer, suffix=suffix)
+                key_name1 = f'bias_ih_l{layer}{suffix}'
+                key_name2 = f'bias_hh_l{layer}{suffix}'
                 bias_keys.append(key_name1)
                 bias_keys.append(key_name2)
 

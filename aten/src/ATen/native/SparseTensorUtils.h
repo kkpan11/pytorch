@@ -11,8 +11,7 @@
 #include <ATen/ops/tensor.h>
 #endif
 
-namespace at {
-namespace sparse {
+namespace at::sparse {
 
 // Just for documentary purposes
 using SparseTensor = Tensor;
@@ -182,5 +181,10 @@ class TensorGeometryHolder<0> {
   geometry_holder_t t_strides;
 };
 
-} // namespace sparse
-} // namespace at
+// Return all indices of a tensor with the given shape.
+//
+// full_coo_indices(shape) is equivalent to
+// torch.ones(shape).nonzero().transpose(-2, -1) but much faster.
+TORCH_API Tensor full_coo_indices(IntArrayRef sizes, TensorOptions options);
+
+} // namespace at::sparse
