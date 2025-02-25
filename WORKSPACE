@@ -21,6 +21,16 @@ http_archive(
     urls = ["https://github.com/tensorflow/runtime/archive/b1c7cce21ba4661c17ac72421c6a0e2015e7bef3.tar.gz"],
 )
 
+http_archive(
+    name = "platforms",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
+        # TODO Fix bazel linter to support hashes for release tarballs.
+        # "https://github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
+    ],
+    # sha256 = "218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee",
+)
+
 load("@rules_cuda//cuda:dependencies.bzl", "rules_cuda_dependencies")
 
 rules_cuda_dependencies(with_rules_cc = False)
@@ -38,8 +48,8 @@ http_archive(
 
 http_archive(
     name = "pybind11_bazel",
-    strip_prefix = "pybind11_bazel-992381ced716ae12122360b0fbadbc3dda436dbf",
-    urls = ["https://github.com/pybind/pybind11_bazel/archive/992381ced716ae12122360b0fbadbc3dda436dbf.zip"],
+    strip_prefix = "pybind11_bazel-b162c7c88a253e3f6b673df0c621aca27596ce6b",
+    urls = ["https://github.com/pybind/pybind11_bazel/archive/b162c7c88a253e3f6b673df0c621aca27596ce6b.zip"],
 )
 
 new_local_repository(
@@ -71,6 +81,13 @@ http_archive(
     ],
 )
 
+http_archive(
+    name = "com_github_opentelemetry-cpp",
+    urls = [
+        "https://github.com/open-telemetry/opentelemetry-cpp/archive/refs/tags/v1.14.2.tar.gz",
+    ],
+)
+
 new_local_repository(
     name = "gloo",
     build_file = "//third_party:gloo.BUILD",
@@ -81,12 +98,6 @@ new_local_repository(
     name = "onnx",
     build_file = "//third_party:onnx.BUILD",
     path = "third_party/onnx",
-)
-
-new_local_repository(
-    name = "foxi",
-    build_file = "//third_party:foxi.BUILD",
-    path = "third_party/foxi",
 )
 
 local_repository(
@@ -155,14 +166,22 @@ new_local_repository(
     path = "third_party/kineto",
 )
 
-new_patched_local_repository(
-    name = "tbb",
-    build_file = "//third_party:tbb.BUILD",
-    patch_strip = 1,
-    patches = [
-        "@//third_party:tbb.patch",
-    ],
-    path = "third_party/tbb",
+new_local_repository(
+    name = "opentelemetry-cpp",
+    build_file = "//third_party::opentelemetry-cpp.BUILD",
+    path = "third_party/opentelemetry-cpp",
+)
+
+new_local_repository(
+    name = "cpp-httplib",
+    build_file = "//third_party:cpp-httplib.BUILD",
+    path = "third_party/cpp-httplib",
+)
+
+new_local_repository(
+    name = "nlohmann",
+    build_file = "//third_party:nlohmann.BUILD",
+    path = "third_party/nlohmann",
 )
 
 new_local_repository(
@@ -192,24 +211,47 @@ http_archive(
 
 http_archive(
     name = "rules_python",
-    sha256 = "aa96a691d3a8177f3215b14b0edc9641787abaaa30363a080165d06ab65e1161",
-    url = "https://github.com/bazelbuild/rules_python/releases/download/0.0.1/rules_python-0.0.1.tar.gz",
+    # TODO Fix bazel linter to support hashes for release tarballs.
+    #
+    # sha256 = "94750828b18044533e98a129003b6a68001204038dc4749f40b195b24c38f49f",
+    strip_prefix = "rules_python-0.21.0",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.21.0/rules_python-0.21.0.tar.gz",
 )
+
+load("@rules_python//python:repositories.bzl", "py_repositories")
+
+py_repositories()
+
+load("@rules_python//python:repositories.bzl", "python_register_toolchains")
+
+python_register_toolchains(
+    name = "python3_10",
+    python_version = "3.10",
+)
+
+load("@python3_10//:defs.bzl", "interpreter")
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+pip_parse(
+    name = "pip_deps",
+    python_interpreter_target = interpreter,
+    requirements_lock = "//:tools/build/bazel/requirements.txt",
+)
+
+load("@pip_deps//:requirements.bzl", "install_deps")
+
+install_deps()
 
 load("@pybind11_bazel//:python_configure.bzl", "python_configure")
 
 python_configure(
     name = "local_config_python",
-    python_version = "3",
+    python_interpreter_target = interpreter,
 )
 
 load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
 
 protobuf_deps()
-
-load("@rules_python//python:repositories.bzl", "py_repositories")
-
-py_repositories()
 
 new_local_repository(
     name = "cuda",
@@ -220,7 +262,13 @@ new_local_repository(
 new_local_repository(
     name = "cudnn",
     build_file = "@//third_party:cudnn.BUILD",
-    path = "/usr/",
+    path = "/usr/local/cuda",
+)
+
+new_local_repository(
+    name = "cudnn_frontend",
+    build_file = "@//third_party:cudnn_frontend.BUILD",
+    path = "third_party/cudnn_frontend/",
 )
 
 local_repository(
@@ -259,6 +307,12 @@ local_repository(
 local_repository(
     name = "gemmlowp",
     path = "third_party/gemmlowp/gemmlowp",
+)
+
+local_repository(
+    name = "kleidiai",
+    path = "third_party/kleidiai",
+    repo_mapping = {"@com_google_googletest": "@com_google_benchmark"},
 )
 
 ### Unused repos start
@@ -311,11 +365,6 @@ local_repository(
 local_repository(
     name = "unused_onnx_benchmark",
     path = "third_party/onnx/third_party/benchmark",
-)
-
-local_repository(
-    name = "unused_onnx_tensorrt_benchmark",
-    path = "third_party/onnx-tensorrt/third_party/onnx/third_party/benchmark",
 )
 
 ### Unused repos end

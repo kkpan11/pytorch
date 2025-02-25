@@ -8,14 +8,14 @@
 import copy
 import os
 import sys
-import unittest
 from contextlib import nullcontext
-from typing import Any, cast, List
+from typing import Any, cast
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
+
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -36,9 +36,8 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     parametrize,
     run_tests,
-    TEST_WITH_ASAN,
-    TEST_WITH_DEV_DBG_ASAN,
 )
+
 
 try:
     import torchvision
@@ -46,6 +45,7 @@ try:
     HAS_TORCHVISION = True
 except ImportError:
     HAS_TORCHVISION = False
+
 
 # Use GLOO on GPU when running CUDA + Windows
 def _get_backend_for_tests():
@@ -61,7 +61,6 @@ def _get_backend_for_tests():
 BACKEND = _get_backend_for_tests()
 
 
-@unittest.skipIf(TEST_WITH_ASAN or TEST_WITH_DEV_DBG_ASAN, "CUDA + ASAN does not work.")
 class TestZeroRedundancyOptimizer(common_distributed.MultiProcessTestCase):
     def setUp(self):
         super().setUp()
@@ -100,8 +99,6 @@ class TestZeroRedundancyOptimizer(common_distributed.MultiProcessTestCase):
         )
 
 
-# TODO: skip_but_pass_in_sandcastle_if does not work here.
-@unittest.skipIf(TEST_WITH_ASAN or TEST_WITH_DEV_DBG_ASAN, "CUDA + ASAN does not work.")
 class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_state_dict(self):
         """Check that ZeroRedundancyOptimizer exposes the expected state dict
@@ -204,7 +201,7 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
                 super().step()
                 kwarg.append(5)
 
-        kwarg: List[Any] = []
+        kwarg: list[Any] = []
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
         o = ZeroRedundancyOptimizer(
             [x],
@@ -400,7 +397,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             )
 
     @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @common_distributed.skip_if_rocm_multiprocess
     def test_step(self):
         """Check that ZeroRedundancyOptimizer properly exposes the ``step()``
         interface."""
@@ -440,7 +437,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             self.assertEqual(m.bias, m_zero.bias)
 
     @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @common_distributed.skip_if_rocm_multiprocess
     def test_step_with_closure(self):
         """Check that ZeroRedundancyOptimizer properly exposes the
         ``step(closure)`` interface."""
@@ -530,7 +527,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             params.append(torch.rand(size, 1))
         o = ZeroRedundancyOptimizer(params, optimizer_class=SGD, lr=LR)
         self.assertEqual(
-            sum([x.numel() for x in o.optim.param_groups[0]["params"]]),
+            sum(x.numel() for x in o.optim.param_groups[0]["params"]),
             sum(sizes),
         )
 
@@ -567,7 +564,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             # all partitions have the same elements
             self.assertEqual(len(o.param_groups), 2)
             self.assertEqual(
-                sum([x.numel() for g in o.optim.param_groups for x in g["params"]]),
+                sum(x.numel() for g in o.optim.param_groups for x in g["params"]),
                 sum(sizes),
             )
             self.assertEqual(len(o.optim.param_groups), 2)
@@ -660,7 +657,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 torch.testing.assert_close(layer1.bias, layer3.bias)
 
     @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @common_distributed.skip_if_rocm_multiprocess
     def test_collect_shards(self):
         """Check the state consolidation mechanism and the state dict exposed
         by ZeroRedundancyOptimizer."""
@@ -725,7 +722,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             common_distributed.logger.info(
                 "Skipping `test_nondefault_process_group()` since world size "
                 "of %s is less than %s",
-                self.world_size, MIN_WORLD_SIZE
+                self.world_size,
+                MIN_WORLD_SIZE,
             )
             return
         BACKEND = dist.Backend.GLOO
@@ -855,8 +853,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 torch.nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
                 torch.nn.Linear(HIDDEN_DIM, OUTPUT_DIM),
             ).to(self.device)
-            model.register_buffer(
-                "test_buffer",
+            model.test_buffer = torch.nn.Buffer(
                 torch.ones((1), device=self.device) * self.rank,
             )
             # Define models/optimizers for DDP with ZeRO and DDP with local
@@ -1063,7 +1060,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     p.grad = grad.detach().clone().to(device)
 
         class _GradientSetter(Joinable):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
 
             def join_hook(self, **kwargs):
@@ -1152,7 +1149,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 return self.net1(x)
 
         class LocalModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.net0 = torch.nn.Linear(10, 10)
                 self.relu = torch.nn.ReLU()
@@ -1275,7 +1272,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     [torch.randn(1, 3, 3, 1000).to(device) for _ in range(NUM_INPUTS)],
                 )
             )
-        for (model, inputs) in models_to_test:
+        for model, inputs in models_to_test:
             # Enable determinism in cudnn operators
             with torch.backends.cudnn.flags(
                 enabled=True, deterministic=True, benchmark=False
@@ -1380,7 +1377,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
     @common_distributed.skip_if_win32()
     @common_distributed.requires_nccl()
     @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @common_distributed.skip_if_rocm_multiprocess
     @parametrize(
         "use_gpu",
         [True],

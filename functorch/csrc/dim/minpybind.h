@@ -8,7 +8,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <utility>
-#include <iostream>
+#include <ostream>
 #include <memory>
 
 #define PY_BEGIN try {
@@ -202,11 +202,11 @@ protected:
 };
 
 
-bool isinstance(handle h, handle c) {
+static bool isinstance(handle h, handle c) {
     return PyObject_IsInstance(h.ptr(), c.ptr());
 }
 
-[[ noreturn ]] void raise_error(handle exception, const char *format, ...) {
+[[ noreturn ]] inline void raise_error(handle exception, const char *format, ...) {
     va_list args;
     va_start(args, format);
     PyErr_FormatV(exception.ptr(), format, args);
@@ -323,6 +323,7 @@ struct list : public object {
     : object(checked_steal(PyList_New(size))) {}
 };
 
+namespace{
 mpy::object unicode_from_format(const char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -344,7 +345,7 @@ mpy::object from_bool(bool b) {
 bool is_sequence(handle h) {
     return PySequence_Check(h.ptr());
 }
-
+}
 
 struct sequence_view : public handle {
     sequence_view(handle h)
@@ -370,7 +371,7 @@ struct sequence_view : public handle {
     }
 };
 
-
+namespace {
 mpy::object repr(handle h) {
     return mpy::object::checked_steal(PyObject_Repr(h.ptr()));
 }
@@ -384,16 +385,8 @@ bool is_int(handle h) {
     return PyLong_Check(h.ptr());
 }
 
-bool is_float(handle h) {
-    return PyFloat_Check(h.ptr());
-}
-
 bool is_none(handle h) {
     return h.ptr() == Py_None;
-}
-
-bool is_bool(handle h) {
-    return PyBool_Check(h.ptr());
 }
 
 Py_ssize_t to_int(handle h) {
@@ -404,20 +397,9 @@ Py_ssize_t to_int(handle h) {
     return r;
 }
 
-double to_float(handle h) {
-    double r = PyFloat_AsDouble(h.ptr());
-    if (PyErr_Occurred()) {
-        throw mpy::exception_set();
-    }
-    return r;
-}
-
-bool to_bool_unsafe(handle h) {
-    return h.ptr() == Py_True;
-}
-
 bool to_bool(handle h) {
     return PyObject_IsTrue(h.ptr()) != 0;
+}
 }
 
 struct slice_view {
@@ -430,7 +412,7 @@ struct slice_view {
     Py_ssize_t start, stop, step, slicelength;
 };
 
-bool is_slice(handle h) {
+static bool is_slice(handle h) {
     return PySlice_Check(h.ptr());
 }
 

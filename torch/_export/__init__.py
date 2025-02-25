@@ -1,353 +1,181 @@
+# mypy: allow-untyped-defs
+import copy
 import dataclasses
+import functools
+import io
+import json
+import logging
+import os
+import re
+import sys
+import types
+import warnings
 import weakref
-from typing import Any, Callable, List, Tuple, Optional, Dict, Union
+import zipfile
+from collections import OrderedDict
+from contextlib import contextmanager
+from functools import lru_cache
 
-import sympy
-from collections import namedtuple
+from typing import Any, Callable, Optional, Union
+from unittest.mock import patch
 
 import torch
-import torch._dynamo
 import torch.fx
-from . import graph_module
-from torch._decomp import core_aten_decompositions
-from torch._dynamo.eval_frame import Constraint
-
 import torch.utils._pytree as pytree
-from torch._export.pass_base import PassType
-from torch.fx.experimental.symbolic_shapes import (
-    ConstraintViolationError,
-    GuardOnDataDependentSymNode,
-    StrictMinMaxConstraint,
+
+from torch._dispatch.python import enable_python_dispatcher
+from torch._guards import compile_context
+from torch._utils_internal import log_export_usage
+from torch.export._tree_utils import reorder_kwargs
+from torch.export.graph_signature import (
+    ArgumentSpec,
+    ConstantArgument,
+    ExportGraphSignature,
+    InputKind,
+    InputSpec,
+    OutputKind,
+    OutputSpec,
+    SymIntArgument,
+    SymBoolArgument,
+    SymFloatArgument,
+    TensorArgument,
 )
-from torch._dynamo.exc import UserError, UserErrorType
-from torch._export.passes import AddRuntimeAssertionsForConstraintsPass
+from torch.fx import traceback as fx_traceback
 from torch.fx._compatibility import compatibility
-from torch.fx.passes.pass_manager import PassManager
-from torch.utils._sympy.value_ranges import ValueRanges, ValueRangeError
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
 
-Value = Any
+from .wrappers import _wrap_submodules
+from .utils import _materialize_cpp_cia_ops
 
-ExportGraphModule = torch.fx.GraphModule
-EXPORT_METADATA = "_export_metadata_key"
-
-
-# Note - [On Export Dynamic Dimension UX]
-#
-# After a lot of discussion, we have settled on a dynamic marking API
-# for export that meets the following constraints:
-# 1) Stateless
-# 2) Safe for numerous .export calls within a single process
-# 3) Simple to use
-# 4) Can be extended to constraints easily
-#
-# While the underlying API is still torch._dynamo.mark_dynamic, we offer a higher
-# level API that meets the constraints above.
-#
-# This API produces an object that is meant to be passed into torch._dynamo.export
-# constraints field. See docs on torch._dynamo.export for more details.
-#
-# Note - The output type and structure here is NOT BC and NOT A CONTRACT, we reserve
-# the right to change the output here at any time, and will do so as we extend the API.
-#
-# result = torch._dynamo.export(
-#     my_model,
-#     *sixtyfour_tensors,
-#     constraints=[
-#         # if you do only dynamic_dim, this is sugar for
-#         # -Inf <= dynamic_dim(blah, 0) <= Inf; we don’t otherwise
-#         # permit direct int->bool conversion
-#         dynamic_dim(blah, 0),
-#         # operator overloading because it makes it clear whether
-#         # or not you’re inclusive-exclusive range or not
-#         0 <= dynamic_dim(blah, 1) <= 100,
-#         # NB: But we actually truncate ranges to be >= 2, because of
-#         # 0/1 specialization
-#     ]
-# )
-def dynamic_dim(t: torch.Tensor, index: int):
-    return Constraint(
-        weakref.ref(t),
-        id(t),
-        index,
-        StrictMinMaxConstraint(
-            vr=ValueRanges(lower=2, upper=sympy.oo), warn_only=False
-        ),
-    )
-
+log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ExportDynamoConfig:
     """
     Manage Export-specific configurations of Dynamo.
-    TODO add tests to make sure the flags are not outdated
     """
-    capture_scalar_outputs: bool = True
-    capture_dynamic_output_shape_ops: bool = True
-    guard_nn_modules: bool = True
-    dynamic_shapes: bool = True
-    specialize_int: bool = True
     allow_rnn: bool = True
 
 
-DECOMP_TABLE = core_aten_decompositions()
+# We only want to print this once to avoid flooding logs in workflows where aot_compile_warning
+# is called multiple times.
+@lru_cache
+def aot_compile_warning():
+    from torch._inductor import config
+
+    log.warning("+============================+")
+    log.warning("|     !!!   WARNING   !!!    |")
+    log.warning("+============================+")
+    log.warning(
+        "torch._export.aot_compile()/torch._export.aot_load() is being deprecated, please switch to "
+        "directly calling torch._inductor.aoti_compile_and_package(torch.export.export())/"
+        "torch._inductor.aoti_load_package() instead.")
 
 
-def _export(
+def aot_compile(
     f: Callable,
-    args: Tuple[Value],
-    constraints: Optional[List[Constraint]] = None,
-) -> torch.fx.GraphModule:
+    args: tuple[Any],
+    kwargs: Optional[dict[str, Any]] = None,
+    *,
+    dynamic_shapes: Optional[dict[str, Any]] = None,
+    options: Optional[dict[str, Any]] = None,
+    remove_runtime_assertions: bool = False,
+    disable_constraint_solver: bool = False,
+    same_signature: bool = True,
+) -> Union[list[str], str]:
     """
-    Private API to export a single entry point or a free function. It is meant to be used
-    inside top level torch.export.
-    """
-    if constraints is None:
-        constraints = []
+    Note: this function is not stable yet
 
-    with torch._dynamo.config.patch(dataclasses.asdict(ExportDynamoConfig())):  # type: ignore[attr-defined]
-        try:
-            gm, _ = torch._dynamo.export(
-                f,
-                *args,
-                aten_graph=True,
-                tracing_mode="symbolic",
-                decomposition_table=DECOMP_TABLE,
-                constraints=constraints,
-                assume_static_by_default=True,
-                functionalize=True,
-            )
-        except (ConstraintViolationError, ValueRangeError) as e:
-            raise UserError(UserErrorType.CONSTRAIN_VIOLATION, str(e))
-        except GuardOnDataDependentSymNode as e:
-            raise UserError(
-                UserErrorType.ANTI_PATTERN,
-                f"Consider annotating your code using constrain_as_*(). {str(e)}")
-
-    flat_args, in_spec = pytree.tree_flatten(args)
-    out_spec = (
-        gm.graph._codegen.pytree_info.out_spec or pytree.tree_flatten(f(*args))[1]  # type: ignore[attr-defined]
-    )
-    # TODO: Track mutation
-    mutation = None
-    export_graph_module = graph_module.make_export_graph_module(
-        gm, gm.graph, in_spec, out_spec, mutation, flat_args
-    )
-    return export_graph_module
-
-
-# MultiMethodExportedProgram represents an exported program that contains
-# multiple methods, all as valid entry points to the program.
-#
-# Internally, each method is represented as a separate ExportGraphModule.
-# Methods (ExportGraphModule's) do not share anything with each other to
-# ensure that each is self-contained. This is important because transformation
-# passes can be local and do not need to concern themselves about other methods
-# that exists on the same MultiMethodExportedProgram.
-# TODO(gmagogsfm): Replace ExportedProgram with MultiMethodExportedProgram.
-
-
-@compatibility(is_backward_compatible=False)
-class MultiMethodExportedProgram:
-    def __init__(self, gms: Dict[str, graph_module.ExportGraphModule]):
-        # TODO(gmagogsfm): Support merging use case where user started by creating
-        # an empty MultiMethodExportedProgram and then start adding more
-        # graph modules to it.
-        assert (
-            len(gms) > 0
-        ), "Expected at least 1 graph module in MultiMethodExportedProgram"
-        self._method_to_graph_module = gms
-
-    # Get the default method, which is either the only method contained
-    # in this MultiMethodExportedProgram or the method named `forward`.
-    # TODO(gmagogsfm):Throw when there is only a single non-forward method in the program
-    def _get_default_method(self):
-        if len(self._method_to_graph_module) == 1:
-            return next(iter(self._method_to_graph_module.values()))
-        elif "forward" in self._method_to_graph_module:
-            return self._method_to_graph_module["forward"]
-        else:
-            return None
-
-    def save(self) -> None:
-        # TODO(gmagogsfm): Implement.
-        raise NotImplementedError()
-
-    def load(self) -> None:
-        # TODO(gmagogsfm): Implement.
-        raise NotImplementedError()
-
-    def find_method(self, name: str) -> Optional[torch.nn.Module]:
-        return self._method_to_graph_module.get(name)
-
-    def merge(self, other: "MultiMethodExportedProgram"):
-        for method_name, gm in other.methods().items():
-            assert (
-                method_name not in self._method_to_graph_module
-            ), f"There already is a method named {method_name} in this program"
-            self._method_to_graph_module[method_name] = gm
-
-    def transform(self, *passes: PassType) -> "MultiMethodExportedProgram":
-        pm = PassManager(list(passes))
-
-        def apply_passes(
-            gm: graph_module.ExportGraphModule,
-        ) -> graph_module.ExportGraphModule:
-            transformed = pm(gm).graph_module
-            assert transformed is not None
-            transformed.meta.update(gm.meta)
-            return transformed
-
-        method_name_to_transformed_graph_modules = {
-            method_name: apply_passes(gm)
-            for method_name, gm in self._method_to_graph_module.items()
-        }
-        return MultiMethodExportedProgram(method_name_to_transformed_graph_modules)
-
-    def methods(self) -> Dict[str, graph_module.ExportGraphModule]:
-        return self._method_to_graph_module
-
-    def __call__(self, *args: Value, **kwargs: Value) -> Value:
-        gm = self._get_default_method()
-
-        assert (
-            gm is not None
-        ), """MultiMethodExportedProgram can not be called directly unless "
-        "it only contains a single method or it contains a `forward` method. "
-        "Please look up one of its methods first via "
-        "`MultiMethodExportedProgram.find_method(method_name)`."""
-
-        return gm(*args, **kwargs)
-
-    def __repr__(self) -> str:
-        # TODO(gmagogsfm): Implement.
-        raise NotImplementedError()
-
-    def __str__(self) -> str:
-        # TODO(gmagogsfm): Implement a real one.
-        return super().__str__()
-
-    def access_property_of_default_method(self, property_name: str):
-        default_module = self._get_default_method()
-        assert (
-            default_module is not None
-        ), f"""Exported program contains more than one methods and none of them "
-        "is named `forward`, it is impossible to identify the default method. "
-        "please look up one of its methods first via `find_method(method_name)` "
-        "to access property: {property_name}."""
-        return getattr(default_module, property_name)
-
-    def add_runtime_assertions(self) -> "MultiMethodExportedProgram":
-        return self.transform(AddRuntimeAssertionsForConstraintsPass())
-
-    @property
-    def meta(self):
-        return self.access_property_of_default_method("meta")
-
-    @property
-    def in_spec(self):
-        return self.meta[graph_module.EXPORT_METADATA].in_spec
-
-    @property
-    def out_spec(self):
-        return self.meta[graph_module.EXPORT_METADATA].out_spec
-
-    @property
-    def graph(self):
-        return self.access_property_of_default_method("graph")
-
-    @property
-    def code(self):
-        return self.access_property_of_default_method("code")
-
-    @property
-    def module(self):
-        default_method = self._get_default_method()
-        assert (
-            default_method is not None
-        ), """Exported program contains more than"
-        " one methods and none of them is named `forward`,"
-        " it is impossible to identify the default method "
-        "to fetch GraphModule for."""
-        return default_method
-
-    # TODO(gmagogsfm): Implement custom __reduce__ to account for lost of
-    # meta['val']
-
-
-CompileSpec = namedtuple("CompileSpec", ["method_name", "callable", "args"])
-
-
-@compatibility(is_backward_compatible=False)
-def export(
-    m: Union[torch.nn.Module, Callable[..., Any]],
-    args: Union[Dict[str, Tuple[Value, ...]], Tuple[Value, ...]],
-    constraints: Optional[List[Constraint]] = None,
-):
-    """
-    capture_multiple traces either an nn.Module or just a callable with PyTorch
-    operations inside and produce a single MultiMethodExportedProgram that
-    can potentially have multiple entry points. When multiple entry points
-    are traced, each of them is stored separately in the resulting
-    MultiMethodExportedProgram without sharing state.
+    Traces either an nn.Module's forward function or just a callable with PyTorch
+    operations inside, generates executable cpp code from the program, and returns
+    the path to the generated shared library
 
     Args:
-        m: the `nn.Module` or callable to trace.
+        f: the `nn.Module` or callable to trace.
 
-        args: Tracing example inputs.
+        args: example positional inputs.
 
-        When `m` is an nn.Module, `args` can be
-        1) A dictionary that maps names of method to their tracing example inputs.
-        in this case, all specified methods will be captured.
-        2) A tuple. In this case, only the `forward` method of `m` will be captured.
-        It is equivalent to passing {"forward", tuple-type-args}
+        kwargs: optional example keyword inputs.
 
-        When `m` is a non-Module callable, `args` must be a Tuple containing
-        tracing example inputs.
+        dynamic_shapes: Should either be:
+            1) a dict from argument names of ``f`` to their dynamic shape specifications,
+            2) a tuple that specifies dynamic shape specifications for each input in original order.
+            If you are specifying dynamism on keyword args, you will need to pass them in the order that
+            is defined in the original function signature.
 
-        # TODO(gmagogsfm): Write tutorial on how to use them
-        constraints: A list of constraints on the dynamic arguments specifying
-        their possible range of their shapes
+            The dynamic shape of a tensor argument can be specified as either
+            (1) a dict from dynamic dimension indices to :func:`Dim` types, where it is
+            not required to include static dimension indices in this dict, but when they are,
+            they should be mapped to None; or (2) a tuple / list of :func:`Dim` types or None,
+            where the :func:`Dim` types correspond to dynamic dimensions, and static dimensions
+            are denoted by None. Arguments that are dicts or tuples / lists of tensors are
+            recursively specified by using mappings or sequences of contained specifications.
+
+        options: A dictionary of options to control inductor
+
+        disable_constraint_solver: Whether the dim constraint solver must be disabled.
 
     Returns:
-        A MultiMethodExportedProgram.
-
-        if `m` is an nn.Module, returned program would have multiple
-        captured methods, each corresponding to one entry in args dictionary.
-
-        if `m` is a non-Module callable, returned program would have a single
-        captured method named `forward`.
-
-    Raises:
-        AssertionError if given method name do not reference a valid method
-        on the given nn.Module.
+        Path to the generated shared library
     """
-    # Normalize m and args.
-    compile_specs = []
-    if isinstance(m, torch.nn.Module):
-        if isinstance(args, tuple):
-            compile_specs.append(CompileSpec("forward", m.forward, args))
-        else:
-            assert isinstance(
-                args, dict
-            ), f"Expected a tuple or Dict[str, tuple], got {type(args)}"
-            for method_name, method_args in args.items():
-                compile_specs.append(
-                    CompileSpec(method_name, getattr(m, method_name), method_args)
-                )
-    else:
-        # Reaching here means `m` is a non-Module callable.
-        assert isinstance(
-            m, Callable  # type: ignore[arg-type]
-        ), f"Only nn.Module or callable allowed, got {type(m)}"
-        assert isinstance(
-            args, tuple
-        ), f"When tracing a non-Module callable, `args` must be a tuple of tracing inputs, but got {type(args)}"
-        compile_specs.append(CompileSpec("forward", m, args))
+    from torch.export._trace import _export_to_torch_ir
+    from torch._inductor.decomposition import select_decomp_table
+    from torch._inductor import config
 
-    method_name_to_graph_module: Dict[str, torch.fx.GraphModule] = {}
-    for compile_spec in compile_specs:
-        method_name_to_graph_module[compile_spec.method_name] = _export(
-            compile_spec.callable, compile_spec.args, constraints
+    aot_compile_warning()
+
+    if config.is_predispatch:
+        gm = torch.export._trace._export(f, args, kwargs, dynamic_shapes, pre_dispatch=True).module()
+    else:
+        # We want to export to Torch IR here to utilize the pre_grad passes in
+        # inductor, which run on Torch IR.
+        gm = _export_to_torch_ir(
+            f,
+            args,
+            kwargs,
+            dynamic_shapes,
+            disable_constraint_solver=disable_constraint_solver,
+            same_signature=same_signature,
+            # Disabling this flag, because instead we can rely on the mapping
+            # dynamo_flat_name_to_original_fqn which is coming from Dynamo.
+            restore_fqn=False,
         )
 
-    return MultiMethodExportedProgram(method_name_to_graph_module)
+    with torch.no_grad():
+        so_path = torch._inductor.aot_compile(gm, args, kwargs, options=options)  # type: ignore[arg-type]
+
+    return so_path
+
+def aot_load(so_path: str, device: str) -> Callable:
+    """
+    Loads a shared library generated by aot_compile and returns a callable
+
+    Args:
+        so_path: Path to the shared library
+
+    Returns:
+        A callable
+    """
+    aot_compile_warning()
+
+    if device == "cpu":
+        runner = torch._C._aoti.AOTIModelContainerRunnerCpu(so_path, 1)  # type: ignore[call-arg]
+    elif device == "cuda" or device.startswith("cuda:"):
+        runner = torch._C._aoti.AOTIModelContainerRunnerCuda(so_path, 1, device)  # type: ignore[assignment, call-arg]
+    elif device == "xpu" or device.startswith("xpu:"):
+        runner = torch._C._aoti.AOTIModelContainerRunnerXpu(so_path, 1, device)  # type: ignore[assignment, call-arg]
+
+    else:
+        raise RuntimeError("Unsupported device " + device)
+
+    def optimized(*args, **kwargs):
+        call_spec = runner.get_call_spec()  # type: ignore[attr-defined]
+        in_spec = pytree.treespec_loads(call_spec[0])
+        out_spec = pytree.treespec_loads(call_spec[1])
+        flat_inputs = pytree.tree_flatten((args, reorder_kwargs(kwargs, in_spec)))[0]
+        flat_inputs = [x for x in flat_inputs if isinstance(x, torch.Tensor)]
+        flat_outputs = runner.run(flat_inputs)  # type: ignore[attr-defined]
+        return pytree.tree_unflatten(flat_outputs, out_spec)
+
+    return optimized

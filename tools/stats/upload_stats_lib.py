@@ -1,32 +1,48 @@
+from __future__ import annotations
+
 import gzip
 import io
 import json
+import math
 import os
-import xml.etree.ElementTree as ET
+import time
 import zipfile
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Optional
 
 import boto3  # type: ignore[import]
 import requests
-import rockset  # type: ignore[import]
+
 
 PYTORCH_REPO = "https://api.github.com/repos/pytorch/pytorch"
-S3_RESOURCE = boto3.resource("s3")
-TARGET_WORKFLOW = "--rerun-disabled-tests"
 
 
-def _get_request_headers() -> Dict[str, str]:
+@lru_cache
+def get_s3_resource() -> Any:
+    return boto3.resource("s3")
+
+
+GHA_ARTIFACTS_BUCKET = "gha-artifacts"
+
+
+# NB: In CI, a flaky test is usually retried 3 times, then the test file would be rerun
+# 2 more times
+MAX_RETRY_IN_NON_DISABLED_MODE = 3 * 3
+
+
+def _get_request_headers() -> dict[str, str]:
     return {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": "token " + os.environ["GITHUB_TOKEN"],
     }
 
 
-def _get_artifact_urls(prefix: str, workflow_run_id: int) -> Dict[Path, str]:
+def _get_artifact_urls(prefix: str, workflow_run_id: int) -> dict[Path, str]:
     """Get all workflow artifacts with 'test-report' in the name."""
     response = requests.get(
         f"{PYTORCH_REPO}/actions/runs/{workflow_run_id}/artifacts?per_page=100",
+        headers=_get_request_headers(),
     )
     artifacts = response.json()["artifacts"]
     while "next" in response.links.keys():
@@ -71,16 +87,22 @@ def _download_artifact(
 
 
 def download_s3_artifacts(
-    prefix: str, workflow_run_id: int, workflow_run_attempt: int
-) -> List[Path]:
-    bucket = S3_RESOURCE.Bucket("gha-artifacts")
+    prefix: str,
+    workflow_run_id: int,
+    workflow_run_attempt: int,
+    job_id: Optional[int] = None,
+) -> list[Path]:
+    bucket = get_s3_resource().Bucket(GHA_ARTIFACTS_BUCKET)
     objs = bucket.objects.filter(
         Prefix=f"pytorch/pytorch/{workflow_run_id}/{workflow_run_attempt}/artifact/{prefix}"
     )
-
     found_one = False
     paths = []
     for obj in objs:
+        object_name = Path(obj.key).name
+        # target an artifact for a specific job_id if provided, otherwise skip the download.
+        if job_id is not None and str(job_id) not in object_name:
+            continue
         found_one = True
         p = Path(Path(obj.key).name)
         print(f"Downloading {p}")
@@ -98,7 +120,7 @@ def download_s3_artifacts(
 
 def download_gha_artifacts(
     prefix: str, workflow_run_id: int, workflow_run_attempt: int
-) -> List[Path]:
+) -> list[Path]:
     artifact_urls = _get_artifact_urls(prefix, workflow_run_id)
     paths = []
     for name, url in artifact_urls.items():
@@ -106,33 +128,36 @@ def download_gha_artifacts(
     return paths
 
 
-def upload_to_rockset(
-    collection: str, docs: List[Any], workspace: str = "commons"
+def upload_to_dynamodb(
+    dynamodb_table: str,
+    repo: str,
+    docs: list[Any],
+    generate_partition_key: Optional[Callable[[str, dict[str, Any]], str]],
 ) -> None:
-    print(f"Writing {len(docs)} documents to Rockset")
-    client = rockset.RocksetClient(
-        host="api.usw2a1.rockset.com", api_key=os.environ["ROCKSET_API_KEY"]
-    )
-    client.Documents.add_documents(
-        collection=collection,
-        data=docs,
-        workspace=workspace,
-    )
-    print("Done!")
+    print(f"Writing {len(docs)} documents to DynamoDB {dynamodb_table}")
+    # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/dynamodb.html#batch-writing
+    with boto3.resource("dynamodb").Table(dynamodb_table).batch_writer() as batch:
+        for doc in docs:
+            if generate_partition_key:
+                doc["dynamoKey"] = generate_partition_key(repo, doc)
+            # This is to move away the _event_time field from Rockset, which we cannot use when
+            # reimport the data
+            doc["timestamp"] = int(round(time.time() * 1000))
+            batch.put_item(Item=doc)
 
 
 def upload_to_s3(
     bucket_name: str,
     key: str,
-    docs: List[Dict[str, Any]],
+    docs: list[dict[str, Any]],
 ) -> None:
-    print(f"Writing {len(docs)} documents to S3")
+    print(f"Writing {len(docs)} documents to S3 {bucket_name}/{key}")
     body = io.StringIO()
     for doc in docs:
         json.dump(doc, body)
         body.write("\n")
 
-    S3_RESOURCE.Object(
+    get_s3_resource().Object(
         f"{bucket_name}",
         f"{key}",
     ).put(
@@ -140,16 +165,17 @@ def upload_to_s3(
         ContentEncoding="gzip",
         ContentType="application/json",
     )
-    print("Done!")
+    print(f"Done! Finish writing document to S3 {bucket_name}/{key} ")
 
 
 def read_from_s3(
     bucket_name: str,
     key: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     print(f"Reading from s3://{bucket_name}/{key}")
     body = (
-        S3_RESOURCE.Object(
+        get_s3_resource()
+        .Object(
             f"{bucket_name}",
             f"{key}",
         )
@@ -160,11 +186,28 @@ def read_from_s3(
     return [json.loads(result) for result in results if result]
 
 
+def remove_nan_inf(old: Any) -> Any:
+    # Casta NaN, inf, -inf to string from float since json.dumps outputs invalid
+    # json with them
+    def _helper(o: Any) -> Any:
+        if isinstance(o, float) and (math.isinf(o) or math.isnan(o)):
+            return str(o)
+        if isinstance(o, list):
+            return [_helper(v) for v in o]
+        if isinstance(o, dict):
+            return {_helper(k): _helper(v) for k, v in o.items()}
+        if isinstance(o, tuple):
+            return tuple(_helper(v) for v in o)
+        return o
+
+    return _helper(old)
+
+
 def upload_workflow_stats_to_s3(
     workflow_run_id: int,
     workflow_run_attempt: int,
     collection: str,
-    docs: List[Dict[str, Any]],
+    docs: list[dict[str, Any]],
 ) -> None:
     bucket_name = "ossci-raw-job-status"
     key = f"{collection}/{workflow_run_id}/{workflow_run_attempt}"
@@ -202,14 +245,24 @@ def unzip(p: Path) -> None:
         zip.extractall(unzipped_dir)
 
 
-def is_rerun_disabled_tests(root: ET.ElementTree) -> bool:
+def is_rerun_disabled_tests(tests: dict[str, dict[str, int]]) -> bool:
     """
-    Check if the test report is coming from rerun_disabled_tests workflow
+    Check if the test report is coming from rerun_disabled_tests workflow where
+    each test is run multiple times
     """
-    skipped = root.find(".//*skipped")
-    # Need to check against None here, if not skipped doesn't work as expected
-    if skipped is None:
-        return False
+    return all(
+        t.get("num_green", 0) + t.get("num_red", 0) > MAX_RETRY_IN_NON_DISABLED_MODE
+        for t in tests.values()
+    )
 
-    message = skipped.attrib.get("message", "")
-    return TARGET_WORKFLOW in message or "num_red" in message
+
+def get_job_id(report: Path) -> int | None:
+    # [Job id in artifacts]
+    # Retrieve the job id from the report path. In our GHA workflows, we append
+    # the job id to the end of the report name, so `report` looks like:
+    #     unzipped-test-reports-foo_5596745227/test/test-reports/foo/TEST-foo.xml
+    # and we want to get `5596745227` out of it.
+    try:
+        return int(report.parts[0].rpartition("_")[2])
+    except ValueError:
+        return None

@@ -1,8 +1,25 @@
+# mypy: allow-untyped-defs
+
+"""
+This module provides utilities for analyzing and optimizing Python bytecode.
+Key functionality includes:
+- Dead code elimination
+- Jump instruction optimization
+- Stack size analysis and verification
+- Live variable analysis
+- Line number propagation and cleanup
+- Exception table handling for Python 3.11+
+
+The utilities in this module are used to analyze and transform bytecode
+for better performance while maintaining correct semantics.
+"""
+
 import bisect
 import dataclasses
 import dis
 import sys
-from numbers import Real
+from typing import Any, Union
+
 
 TERMINAL_OPCODES = {
     dis.opmap["RETURN_VALUE"],
@@ -10,13 +27,16 @@ TERMINAL_OPCODES = {
     dis.opmap["RAISE_VARARGS"],
     # TODO(jansel): double check exception handling
 }
-if sys.version_info >= (3, 9):
-    TERMINAL_OPCODES.add(dis.opmap["RERAISE"])
+TERMINAL_OPCODES.add(dis.opmap["RERAISE"])
 if sys.version_info >= (3, 11):
     TERMINAL_OPCODES.add(dis.opmap["JUMP_BACKWARD"])
     TERMINAL_OPCODES.add(dis.opmap["JUMP_FORWARD"])
 else:
     TERMINAL_OPCODES.add(dis.opmap["JUMP_ABSOLUTE"])
+if sys.version_info >= (3, 12):
+    TERMINAL_OPCODES.add(dis.opmap["RETURN_CONST"])
+if sys.version_info >= (3, 13):
+    TERMINAL_OPCODES.add(dis.opmap["JUMP_BACKWARD_NO_INTERRUPT"])
 JUMP_OPCODES = set(dis.hasjrel + dis.hasjabs)
 JUMP_OPNAMES = {dis.opname[opcode] for opcode in JUMP_OPCODES}
 HASLOCAL = set(dis.haslocal)
@@ -127,9 +147,9 @@ def remove_extra_line_nums(instructions):
 
 @dataclasses.dataclass
 class ReadsWrites:
-    reads: set
-    writes: set
-    visited: set
+    reads: set[Any]
+    writes: set[Any]
+    visited: set[Any]
 
 
 def livevars_analysis(instructions, instruction):
@@ -173,8 +193,8 @@ class FixedPointBox:
 
 @dataclasses.dataclass
 class StackSize:
-    low: Real
-    high: Real
+    low: Union[int, float]
+    high: Union[int, float]
     fixed_point: FixedPointBox
 
     def zero(self):
@@ -197,7 +217,7 @@ class StackSize:
             self.fixed_point.value = False
 
 
-def stacksize_analysis(instructions):
+def stacksize_analysis(instructions) -> Union[int, float]:
     assert instructions
     fixed_point = FixedPointBox()
     stack_sizes = {
@@ -215,9 +235,8 @@ def stacksize_analysis(instructions):
             stack_size = stack_sizes[inst]
             if inst.opcode not in TERMINAL_OPCODES:
                 assert next_inst is not None, f"missing next inst: {inst}"
-                stack_sizes[next_inst].offset_of(
-                    stack_size, stack_effect(inst.opcode, inst.arg, jump=False)
-                )
+                eff = stack_effect(inst.opcode, inst.arg, jump=False)
+                stack_sizes[next_inst].offset_of(stack_size, eff)
             if inst.opcode in JUMP_OPCODES:
                 stack_sizes[inst.target].offset_of(
                     stack_size, stack_effect(inst.opcode, inst.arg, jump=True)
@@ -233,8 +252,8 @@ def stacksize_analysis(instructions):
             stack_size = stack_sizes[inst]
             print(stack_size.low, stack_size.high, inst)
 
-    low = min([x.low for x in stack_sizes.values()])
-    high = max([x.high for x in stack_sizes.values()])
+    low = min(x.low for x in stack_sizes.values())
+    high = max(x.high for x in stack_sizes.values())
 
     assert fixed_point.value, "failed to reach fixed point"
     assert low >= 0

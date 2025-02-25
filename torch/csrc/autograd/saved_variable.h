@@ -9,8 +9,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
 using Variable = at::Tensor;
 struct Node;
@@ -27,10 +26,12 @@ class TORCH_API SavedVariable {
       bool is_output,
       bool is_inplace_on_view = false);
   SavedVariable(
-      const c10::optional<Variable>& variable,
+      const std::optional<Variable>& variable,
       bool is_output,
       bool is_inplace_on_view = false);
+  SavedVariable(const SavedVariable&) = delete;
   SavedVariable(SavedVariable&&) = default;
+  SavedVariable& operator=(const SavedVariable&) = delete;
   SavedVariable& operator=(SavedVariable&&) = default;
   ~SavedVariable() {
     if (fw_grad_) {
@@ -47,6 +48,10 @@ class TORCH_API SavedVariable {
   void register_hooks(std::unique_ptr<SavedVariableHooks>&& hooks);
 
   void reset_data();
+
+  bool has_hooks() const {
+    return (bool)hooks_;
+  }
 
  private:
   // This field contains either:
@@ -83,7 +88,6 @@ class TORCH_API SavedVariable {
   // In that case, the grad_fn passed in to the unpack function at unwrapping
   // time is unused.
   std::weak_ptr<Node> weak_grad_fn_;
-  c10::VariableVersion version_counter_;
 
   uint32_t saved_version_ = 0;
   uint32_t output_nr_ = 0;
@@ -102,7 +106,11 @@ class TORCH_API SavedVariable {
   // hooks are defined. They are set before pack_hook is called and used after
   // unpack_hook is called.
   std::shared_ptr<Node> grad_fn_;
-  std::weak_ptr<Node> grad_accumulator_;
+  // For the usual case where leaf tensors are the input, we expect its
+  // grad_acc to be kept alive by the graph. The reason SavedVariable holds
+  // a owning reference is to support the case where a custom autograd Function
+  // saves an intermediate.
+  std::shared_ptr<Node> grad_accumulator_;
   bool requires_grad_ = false;
 
   void save_metadata(const Variable& data);
@@ -111,5 +119,4 @@ class TORCH_API SavedVariable {
       std::unique_ptr<SavedVariableHooks>&& hooks,
       const Variable& data);
 };
-} // namespace autograd
-} // namespace torch
+} // namespace torch::autograd

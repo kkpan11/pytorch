@@ -1,19 +1,46 @@
+# mypy: allow-untyped-defs
+# mypy: disable-error-code="method-assign"
+
+"""
+Debug utilities for TorchDynamo compilation and execution.
+
+This module provides various debugging tools and utilities for TorchDynamo, including:
+
+- Minification support for reducing test cases while preserving bugs
+- Input/output handling via InputReader and InputWriter for reproducible testing
+- Accuracy checking between original and compiled models
+- Neural network module string conversion via NNModuleToString
+- Profiling tools and system information collection
+- Buck build system integration for Meta-internal testing
+
+Key classes:
+- InputReader/InputWriter: Handle serialization of model inputs/outputs
+- NNModuleToString: Converts nn.Modules to string representations
+- BuckTargetWriter: Manages Buck build system integration
+"""
+
+import atexit
 import copy
+import cProfile
 import functools
 import getpass
+import inspect
 import itertools
 import logging
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 from collections import Counter
 from importlib import import_module
-from typing import Optional, Sequence
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 import torch._prims_common as utils
-
+import torch._subclasses.meta_utils
+from torch import Tensor
 from torch._dynamo.testing import rand_strided
 from torch._prims_common import is_float_dtype
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -22,14 +49,17 @@ from torch.utils._content_store import ContentStoreReader, ContentStoreWriter
 from . import config
 from .utils import clone_inputs, get_debug_dir
 
+
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 inductor_config = import_module("torch._inductor.config")
 use_buck = inductor_config.is_fbcode()
 
 if use_buck:
-    import libfb.py.build_info  # type: ignore[import]
+    import libfb.py.build_info
 
 
 extra_deps = []
@@ -41,7 +71,7 @@ if use_buck:
         "//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu",
         "//deeplearning/fbgemm/fbgemm_gpu:sparse_ops",
     ]
-    cur_target = libfb.py.build_info.BuildInfo.get_build_rule().replace("fbcode:", "//")
+    cur_target = libfb.py.build_info.BuildInfo.get_build_rule().replace("fbcode:", "//")  # type: ignore[possibly-undefined]
     extra_imports = "\n".join([f'torch.ops.load_library("{x}")' for x in extra_deps])
 
 
@@ -75,6 +105,7 @@ python_binary(
     compile = False,
     deps = [
         "//caffe2:torch",
+        "//caffe2:libtorch",
         "//caffe2/functorch:functorch",
         "//triton:triton",
         "{cur_target}",
@@ -83,6 +114,7 @@ python_binary(
 {extra_cpp_deps}
     ],
     main_module = "{self.path}",
+    par_style = "xar",
 )
 """
         )
@@ -160,7 +192,7 @@ class NNModuleToString:
             """
             from torch.nn import *
             class Repro(torch.nn.Module):
-                def __init__(self):
+                def __init__(self) -> None:
                     super().__init__()
             """
         )
@@ -172,7 +204,7 @@ class NNModuleToString:
             example_param = next(module.parameters(), None)
             if example_param is not None and example_param.is_cuda:
                 module_str = f"{module_str}.cuda()"
-            model_str += f"{tab*2}self.{module_name} = {module_str}\n"
+            model_str += f"{tab * 2}self.{module_name} = {module_str}\n"
 
         for buffer_name, buffer in gm._buffers.items():
             if buffer is None:
@@ -191,7 +223,9 @@ class NNModuleToString:
                 )
             if buffer.is_cuda:
                 tensor_str = f"{tensor_str}.cuda()"
-            model_str += f"{tab*2}self.register_buffer('{buffer_name}', {tensor_str})\n"
+            model_str += (
+                f"{tab * 2}self.register_buffer('{buffer_name}', {tensor_str})\n"
+            )
 
         for param_name, param in gm._parameters.items():
             if param is None:
@@ -200,7 +234,7 @@ class NNModuleToString:
             if param.is_cuda:
                 maybe_device = ', device="cuda"'
             tensor_str = f"torch.nn.Parameter(torch.randn({list(param.shape)}, dtype={param.dtype}{maybe_device}))"
-            model_str += f"{tab*2}self.{param_name} = {tensor_str}\n"
+            model_str += f"{tab * 2}self.{param_name} = {tensor_str}\n"
 
         # TODO - Keep this code for now. But, I don't think we will need this.
         # attrs = dir(gm)
@@ -220,11 +254,11 @@ def _cuda_system_info_comment():
 
     model_str = "# CUDA Info: \n"
     try:
-        cuda_version_out = subprocess.run(["nvcc", "--version"], stdout=subprocess.PIPE)
-        cuda_version_lines = cuda_version_out.stdout.decode().split("\n")
+        cuda_version_out = subprocess.check_output(["nvcc", "--version"])
+        cuda_version_lines = cuda_version_out.decode().split("\n")
         comment = "".join([f"# {s} \n" for s in cuda_version_lines if s not in [""]])
         model_str += f"{comment}\n"
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.CalledProcessError):
         model_str += "# nvcc not found\n"
 
     gpu_names = Counter(
@@ -238,6 +272,31 @@ def _cuda_system_info_comment():
     return model_str
 
 
+def generate_env_vars_string(*, stable_output=False):
+    """
+    Generate a string configuration for environment variables related to Dynamo, Inductor, and Triton.
+    """
+    if stable_output:
+        return "# env var omitted due to stable_output=True"
+
+    allow_list = ["TORCH", "DYNAMO", "INDUCTOR", "TRITON"]
+    skip_list = ["TRITON_LIBDEVICE_PATH", "TRITON_PTXAS_PATH", "TRITON_LIBCUDA_PATH"]
+
+    def filter(key):
+        return any(string in key for string in allow_list) and key not in skip_list
+
+    config_lines = [
+        f"os.environ['{key}'] = '{value}'"
+        for key, value in os.environ.items()
+        if filter(key)
+    ]
+    config_string = "\n".join(config_lines)
+    return f"""\
+import os
+{config_string}
+    """
+
+
 def generate_config_string(*, stable_output=False):
     import torch._functorch.config
     import torch._inductor.config
@@ -245,13 +304,16 @@ def generate_config_string(*, stable_output=False):
     if stable_output:
         return "# config omitted due to stable_output=True"
 
+    experimental_config = torch.fx.experimental._config.codegen_config()  # type: ignore[attr-defined]
     return f"""\
 import torch._dynamo.config
 import torch._inductor.config
 import torch._functorch.config
+import torch.fx.experimental._config
 {torch._dynamo.config.codegen_config()}
 {torch._inductor.config.codegen_config()}
 {torch._functorch.config.codegen_config()}
+{experimental_config}
 """
 
 
@@ -261,7 +323,7 @@ def get_minifier_repro_path():
 
 def helper_for_dump_minify(contents):
     minified_repro_path = get_minifier_repro_path()
-    log.warning("Writing minified repro to %s", minified_repro_path)
+    log.warning("Writing minified repro to:\n%s", minified_repro_path)
 
     if use_buck:
         BuckTargetWriter(minified_repro_path).write()
@@ -270,7 +332,7 @@ def helper_for_dump_minify(contents):
             fd.write(contents)
 
     except OSError as e:
-        log.exception(e)
+        log.exception("")
         raise NotImplementedError("Could not write to {minified_repro_path}") from e
 
 
@@ -291,33 +353,25 @@ def clone_inputs_retaining_gradness(example_inputs):
     return cloned_inputs
 
 
-def run_fwd_maybe_bwd(gm, args, only_fwd=False):
+def run_fwd_maybe_bwd(gm, args, only_fwd=False, disable_clone=False):
     """
     Runs a forward and possibly backward iteration for a given mod and args.
-    """
-    from torch._functorch.aot_autograd import make_boxed_func
 
+    When disable_clone is True, we will use args as-is without cloning.
+    This is higher fidelity but we may destroy the args in the process.
+    """
     from .testing import collect_results, reduce_to_scalar_loss, requires_bwd_pass
 
     gm = copy.deepcopy(gm)
-    args = clone_inputs_retaining_gradness(args)
+    if not disable_clone:
+        args = clone_inputs_retaining_gradness(args)
 
     if hasattr(gm, "zero_grad"):
         gm.zero_grad(True)
 
-    # TorchInductor returned callable expects lists. So, boxing the call.
-    orig_named_parameters = getattr(gm, "named_parameters", None)
-    orig_named_buffers = getattr(gm, "named_buffers", None)
-    if not hasattr(gm, "_boxed_call") and (
-        orig_named_parameters is not None or orig_named_buffers is not None
-    ):
-        gm = make_boxed_func(gm)
-        if orig_named_parameters is not None:
-            gm.named_parameters = orig_named_parameters
-        if orig_named_buffers is not None:
-            gm.named_buffers = orig_named_buffers
+    # TorchInductor returned callable expects lists. So, may need a boxed calling convention.
+    out = gm(args) if hasattr(gm, "_boxed_call") else gm(*args)
 
-    out = gm(args)
     if only_fwd:
         return out
     if requires_bwd_pass(out):
@@ -343,20 +397,7 @@ def same_two_models(
         is mostly useful for the minifier (which wants to avoid quantizing floating point
         error into integer/boolean error)
     """
-    from .eval_frame import OptimizedModule
-    from .testing import (
-        named_buffers_for_optimized_module,
-        named_parameters_for_optimized_module,
-    )
     from .utils import same
-
-    if isinstance(gm, OptimizedModule):
-        gm.named_parameters = named_parameters_for_optimized_module(gm)
-        gm.named_buffers = named_buffers_for_optimized_module(gm)
-
-    if isinstance(opt_gm, OptimizedModule):
-        opt_gm.named_parameters = named_parameters_for_optimized_module(opt_gm)
-        opt_gm.named_buffers = named_buffers_for_optimized_module(opt_gm)
 
     ref = run_fwd_maybe_bwd(gm, example_inputs, only_fwd)
 
@@ -369,20 +410,20 @@ def same_two_models(
             fp64_ref = run_fwd_maybe_bwd(fp64_model, fp64_examples, only_fwd)
         except Exception:
             if require_fp64:
-                raise RuntimeError("Could not generate fp64 outputs")
+                raise RuntimeError(  # noqa: B904
+                    "Could not generate fp64 outputs, workaround with torch._dynamo.config.same_two_models_use_fp64 = False"
+                )
             log.warning("Could not generate fp64 outputs")
 
     try:
         res = run_fwd_maybe_bwd(opt_gm, example_inputs, only_fwd)
-    except Exception as e:
+    except Exception:
         # This means that the minified graph is bad/exposes a different problem.
         # As we are checking accuracy here, lets log the exception and return True.
         log.exception(
-            (
-                "While minifying the program in accuracy minification mode, "
-                "ran into a runtime exception which is likely an unrelated issue."
-                " Skipping this graph."
-            )
+            "While minifying the program in accuracy minification mode, "
+            "ran into a runtime exception which is likely an unrelated issue."
+            " Skipping this graph."
         )
         return True
 
@@ -397,7 +438,7 @@ def same_two_models(
     return passing
 
 
-def cast_convert_element_type_to_fp64(model):
+def cast_dtype_args_to_fp64(model):
     for node in model.graph.nodes:
         if (
             node.op == "call_function"
@@ -406,6 +447,13 @@ def cast_convert_element_type_to_fp64(model):
             assert len(node.args) == 2
             if is_float_dtype(node.args[1]) and node.args[1] != torch.float64:
                 node.args = (node.args[0], torch.float64)
+        if node.op == "call_function":
+            dtype = node.kwargs.get("dtype")
+            if dtype is not None and is_float_dtype(dtype):
+                new_kwargs = dict(node.kwargs)
+                new_kwargs["dtype"] = torch.float64
+                node.kwargs = new_kwargs
+
     model.graph.lint()
     model.recompile()
     return model
@@ -417,8 +465,8 @@ def cast_to(dtype, model, inputs):
     model = model.to(dtype)
     if dtype == torch.float64:
         # If casting to fp64 for accuracy comparison, we need to
-        # take care of convert_element_type explicitly
-        model = cast_convert_element_type_to_fp64(model)
+        # replace dtype arguments embedded in the graph with fp64
+        model = cast_dtype_args_to_fp64(model)
 
     inputs = tree_map(
         lambda x: x.to(dtype)
@@ -454,15 +502,13 @@ def backend_accuracy_fails(
             require_fp64=require_fp64,
             ignore_non_fp=ignore_non_fp,
         )
-    except Exception as e:
-        # This means that the the minified graph is bad/exposes a different problem.
+    except Exception:
+        # This means that the minified graph is bad/exposes a different problem.
         # As we are checking accuracy here, lets log the exception and return False.
         log.exception(
-            (
-                "While minifying the program in accuracy minification mode, "
-                "ran into a runtime exception which is likely an unrelated issue."
-                " Skipping this graph"
-            )
+            "While minifying the program in accuracy minification mode, "
+            "ran into a runtime exception which is likely an unrelated issue."
+            " Skipping this graph"
         )
         return False
 
@@ -477,25 +523,26 @@ def backend_accuracy_fails(
 
 
 def _stride_or_default(
-    stride: Optional[Sequence[int]], *, shape: Sequence[int]
-) -> Sequence[int]:
+    stride: Optional["torch._prims_common.StrideType"],
+    *,
+    shape: "torch._prims_common.ShapeType",
+) -> "torch._prims_common.StrideType":
     return stride if stride is not None else utils.make_contiguous_strides_for(shape)
 
 
-def _dtype_or_default(dtype: Optional[torch.dtype]) -> torch.dtype:
-    return dtype if dtype is not None else torch.float32
+def _mk_defaulter(d: T) -> Callable[[Optional[T]], T]:
+    return lambda x: x if x is not None else d
 
 
-def _device_or_default(device: Optional[torch.device]) -> torch.device:
-    return device if device is not None else torch.device("cpu")
-
-
-def _storage_offset_or_default(storage_offset: Optional[int]) -> int:
-    return storage_offset if storage_offset is not None else 0
+_dtype_or_default = _mk_defaulter(torch.float32)
+_device_or_default = _mk_defaulter(torch.device("cpu"))
+_storage_offset_or_default = _mk_defaulter(0)
+_requires_grad_or_default = _mk_defaulter(False)
+_is_leaf_or_default = _mk_defaulter(False)
 
 
 class NopInputReader:
-    def __init__(self):
+    def __init__(self) -> None:
         self.total = 0
 
     def storage(self, storage_hash, nbytes, *, device=None, dtype_hint=None):
@@ -552,13 +599,27 @@ class InputReader:
         *,
         storage_offset=None,
         dtype=None,
+        requires_grad=None,
+        is_leaf=None,
         **metadata,
     ):
         stride = _stride_or_default(stride, shape=shape)
         storage_offset = _storage_offset_or_default(storage_offset)
         dtype = _dtype_or_default(dtype)
-        t = torch.tensor([], dtype=dtype, device=storage.device)
-        t.set_(storage, storage_offset, shape, stride)
+        is_leaf = _is_leaf_or_default(is_leaf)
+        requires_grad = _requires_grad_or_default(requires_grad)
+        t = torch.tensor(
+            [], dtype=dtype, device=storage.device, requires_grad=requires_grad
+        )
+        with torch.no_grad():
+            t.set_(storage, storage_offset, shape, stride)
+        if not is_leaf:
+            # Fake up some autograd history in a very naughty way
+            with torch.enable_grad():
+                t = t.clone(memory_format=torch.preserve_format)
+            with torch.no_grad():
+                t.set_(storage, storage_offset, shape, stride)
+        assert torch._subclasses.meta_utils.safe_is_leaf(t) == is_leaf
         torch._utils.set_tensor_metadata(t, metadata)
         self.args.append(t)
         return t  # for BC
@@ -637,27 +698,58 @@ class InputWriter:
         return v
 
     def tensor(self, name, t) -> None:
+        from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
+
         storage = self.storage(
             t.untyped_storage(), dtype_hint=t.dtype, device_hint=t.device
         )
-        maybe_stride = ""
-        if _stride_or_default(None, shape=t.shape) != t.stride():
-            maybe_stride = f", {tuple(t.stride())}"
-        maybe_dtype = ""
+        args = []
+        # NB: this is positional, must come first
+        if not statically_known_true(
+            sym_eq(_stride_or_default(None, shape=t.shape), t.stride())
+        ):
+            args.append(str(tuple(t.stride())))
         if _dtype_or_default(None) != t.dtype:
-            maybe_dtype = f", dtype={t.dtype!r}"
-        maybe_storage_offset = ""
-        if _storage_offset_or_default(None) != t.storage_offset():
-            maybe_storage_offset = f", storage_offset={t.storage_offset()!r}"
-        maybe_tensor_metadata = ""
+            args.append(f"dtype={t.dtype!r}")
+        if not statically_known_true(
+            _storage_offset_or_default(None) == t.storage_offset()
+        ):
+            args.append(f"storage_offset={t.storage_offset()!r}")
         tensor_metadata = torch._utils.get_tensor_metadata(t)
         if tensor_metadata:
-            maybe_tensor_metadata = ", " + ", ".join(
-                f"{k}={v!r}" for k, v in tensor_metadata.items()
-            )
+            args.extend(f"{k}={v!r}" for k, v in tensor_metadata.items())
+        if _requires_grad_or_default(None) != t.requires_grad:
+            args.append(f"requires_grad={t.requires_grad!r}")
+        is_leaf = torch._subclasses.meta_utils.safe_is_leaf(t)
+        if _is_leaf_or_default(None) != is_leaf:
+            args.append(f"is_leaf={is_leaf!r}")
         self._lines.append(
-            f"reader.tensor({storage}, {tuple(t.shape)}"
-            f"{maybe_stride}{maybe_storage_offset}{maybe_dtype}{maybe_tensor_metadata})  # {name}"
+            "reader.tensor("
+            + ", ".join([storage, str(tuple(t.shape)), *args])
+            + f")  # {name}"
+        )
+
+    def unsupported(self, name, arg):
+        # NB: Try hard not to /print/ a tensor, that will be very slow
+        self._lines.append(f"# {name} was unsupported type for dumping: {type(arg)}")
+        # Best effort dump as much useful stuff we can lol, in case you want
+        # to repair the repro
+        if isinstance(arg, (list, tuple)):
+            self._lines.append('"""')
+            for i, a in enumerate(arg):
+                name_i = f"{name}[{i}]"
+                if isinstance(a, torch.Tensor):
+                    self.tensor(name_i, a)
+                elif isinstance(a, (int, torch.SymInt)):
+                    self.symint(name_i, a)
+                else:
+                    self.unsupported(name_i, a)
+            self._lines.append('"""')
+
+    # write out that the arg was filtered out as it is constant
+    def const(self, name) -> None:
+        self._lines.append(
+            f"reader.const({name!r})  # {name}, filtered out during compilation"
         )
 
     # TODO: this doesn't actually symint atm
@@ -665,3 +757,140 @@ class InputWriter:
         if isinstance(val, torch.SymInt):
             val = val.node.hint
         self._lines.append(f"reader.symint({val!r})  # {name}")
+
+
+def aot_graph_input_parser(
+    func: Callable[[list[Tensor]], list[Tensor]],
+    device: str = "cuda",
+    sym_shapes: Optional[dict[str, int]] = None,
+    default_sym_shape: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Takes in a function which has been printed with print_readable() and constructs kwargs to run it.
+
+    Handles Tensor inputs, Symints, and a graph module which might have tensor constants.
+
+    Consider a function `forward` defined as follows:
+
+    def forward(self, primals_1: "f32[1001, 6]", primals_2: "f32[s0]", primals_3: "Sym(s0)",):
+        _tensor_constant0: "i64[4190]" = self._tensor_constant0
+        # Further implementation
+
+    kwargs = aot_graph_input_parser(forward)
+    forward(**kwargs)
+    """
+
+    from torch.fx.graph import dtype_abbrs
+
+    dtype_map = {value: key for key, value in dtype_abbrs.items()}
+    dtype_pattern = "|".join(dtype_abbrs.values())
+
+    # Extracting the source code from the function
+    source = inspect.getsource(func)
+
+    # Regular expressions
+    tensor_assignment_regex = rf"(_tensor_constant\d+): \"({dtype_pattern})\[\s*(.*?)\s*\]\" = self\.(_tensor_constant\d+)"
+    tensor_regex = rf"({dtype_pattern})\[\s*(.*?)\s*\]"
+    sym_shape_regex = r"Sym\((s\d+)\)"
+
+    class TensorContainer:
+        "Container for tensors as attributes"
+
+    # Dictionary for tensors from annotations
+    kwargs: dict[str, Any] = {}
+
+    sym_shapes = sym_shapes or {}
+
+    def get_sym_int(symint):
+        torch._check(
+            symint in sym_shapes or default_sym_shape is not None,
+            lambda: f"{symint} not in symbolic_shapes and default sym shape not passed in",
+        )
+        return sym_shapes.get(symint, default_sym_shape)
+
+    def gen_tensor(shape, dtype) -> Tensor:
+        # Resolve symbolic shapes to concrete values
+        resolved_shape = []
+        dynamic_dims = []
+        for i, dim in enumerate(shape):
+            dim = dim.strip()
+            if "s" in dim:
+                s = get_sym_int(dim)
+                resolved_shape.append(s)
+                dynamic_dims.append(i)
+            else:
+                if dim:
+                    resolved_shape.append(int(dim))
+
+        constructor = torch.randn if dtype.is_floating_point else torch.zeros
+        out = constructor(resolved_shape, dtype=dtype, device=device)  # type: ignore[call-arg]
+        for d in dynamic_dims:
+            torch._dynamo.mark_dynamic(out, d)
+        return out
+
+    # Parse function annotations for tensor generation
+    annotations = func.__annotations__
+    for param, annotation in annotations.items():
+        # Skip 'return' annotation
+        if param == "return":
+            continue
+
+        match = re.search(tensor_regex, annotation)
+        if match:
+            data_type, shape_str = match.groups()
+            shape = tuple(shape_str.split(","))
+            dtype = dtype_map[data_type]
+            kwargs[param] = gen_tensor(shape, dtype)
+
+        match = re.search(sym_shape_regex, annotation)
+        if match:
+            kwargs[param] = get_sym_int(match.group(1))
+
+    if "self" in inspect.signature(func).parameters:
+        container = TensorContainer()
+        kwargs["self"] = container
+        for match in re.finditer(tensor_assignment_regex, source):
+            attr_name, data_type, shape_str, _ = match.groups()
+            shape = tuple(shape_str.split(","))
+            dtype = dtype_map[data_type]
+            setattr(container, attr_name, gen_tensor(shape, dtype))
+
+    return kwargs
+
+
+def profile_to_file(filename: str) -> Callable[[T], T]:
+    """
+    Decorator to cProfile a given function and save the result to disk on process exit.
+
+    Args:
+        filename: filename to save profile to
+    """
+    prof = cProfile.Profile()
+    filename = os.path.abspath(os.path.expanduser(filename))
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            prof.enable()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                prof.disable()
+
+        return wrapper
+
+    def save_it():
+        prof.dump_stats(filename)
+        sys.stderr.write(
+            textwrap.dedent(
+                f"""\
+                Wrote profile to {filename}, view with:
+
+                    snakeviz {filename}
+
+                """
+            )
+        )
+
+    atexit.register(save_it)
+    return decorator

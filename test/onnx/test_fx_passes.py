@@ -1,6 +1,5 @@
 # Owner(s): ["module: onnx"]
-from __future__ import annotations
-
+import torch
 import torch._dynamo
 import torch.fx
 from torch.onnx._internal.fx.passes import _utils as pass_utils
@@ -15,7 +14,7 @@ class TestFxPasses(common_utils.TestCase):
         x = torch.randn(3)
         y = torch.randn(3)
         z = torch.randn(3)
-        gm, _ = torch._dynamo.export(func, x, y, z)
+        gm, _ = torch._dynamo.export(func)(x, y, z)
         torch._dynamo.reset()
 
         # Purposely name the nodes in a way that will cause a recursive collision later.
@@ -43,7 +42,7 @@ class TestFxPasses(common_utils.TestCase):
         x = torch.randn(3)
         y = torch.randn(3)
         z = torch.randn(3)
-        gm, _ = torch._dynamo.export(func, x, y, z)
+        gm, _ = torch._dynamo.export(func)(x, y, z)
         torch._dynamo.reset()
 
         # Run `set_node_name` and verify that the names are correct.

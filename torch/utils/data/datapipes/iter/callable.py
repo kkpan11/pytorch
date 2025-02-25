@@ -1,27 +1,33 @@
+# mypy: allow-untyped-defs
 import functools
 from collections import namedtuple
+from collections.abc import Iterator, Sized
+from typing import Any, Callable, Optional, TypeVar, Union
 
-from typing import Callable, Iterator, Sized, TypeVar, Optional, Union, Any, Dict, List
-
-from torch.utils.data.datapipes._decorator import functional_datapipe
 from torch.utils.data._utils.collate import default_collate
+from torch.utils.data.datapipes._decorator import functional_datapipe
 from torch.utils.data.datapipes.dataframe import dataframe_wrapper as df_wrapper
 from torch.utils.data.datapipes.datapipe import IterDataPipe
-from torch.utils.data.datapipes.utils.common import (_check_unpickable_fn,
-                                                     validate_input_col)
+from torch.utils.data.datapipes.utils.common import (
+    _check_unpickable_fn,
+    validate_input_col,
+)
+
 
 __all__ = [
     "CollatorIterDataPipe",
     "MapperIterDataPipe",
 ]
 
-T_co = TypeVar("T_co", covariant=True)
+
+_T_co = TypeVar("_T_co", covariant=True)
 
 
 @functional_datapipe("map")
-class MapperIterDataPipe(IterDataPipe[T_co]):
+class MapperIterDataPipe(IterDataPipe[_T_co]):
     r"""
     Applies a function over each item from the source DataPipe (functional name: ``map``).
+
     The function can be any regular Python function or partial object. Lambda
     function is not recommended as it is not supported by pickle.
 
@@ -57,6 +63,7 @@ class MapperIterDataPipe(IterDataPipe[T_co]):
         >>> list(map_dp_2)
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     """
+
     datapipe: IterDataPipe
     fn: Callable
 
@@ -118,44 +125,47 @@ class MapperIterDataPipe(IterDataPipe[T_co]):
         # Convert list back to tuple
         return tuple(data) if t_flag else data
 
-    def __iter__(self) -> Iterator[T_co]:
+    def __iter__(self) -> Iterator[_T_co]:
         for data in self.datapipe:
             yield self._apply_fn(data)
 
     def __len__(self) -> int:
         if isinstance(self.datapipe, Sized):
             return len(self.datapipe)
-        raise TypeError(
-            "{} instance doesn't have valid length".format(type(self).__name__)
-        )
+        raise TypeError(f"{type(self).__name__} instance doesn't have valid length")
 
 
 def _collate_helper(conversion, item):
     # TODO(VitalyFedyunin): Verify that item is any sort of batch
     if len(item.items) > 1:
         # TODO(VitalyFedyunin): Compact all batch dataframes into one
-        raise Exception("Only supports one DataFrame per batch")
+        raise RuntimeError("Only supports one DataFrame per batch")
     df = item[0]
     columns_name = df_wrapper.get_columns(df)
-    tuple_names: List = []
-    tuple_values: List = []
+    tuple_names: list = []
+    tuple_values: list = []
 
     for name in conversion.keys():
         if name not in columns_name:
-            raise Exception("Conversion keys missmatch")
+            raise RuntimeError("Conversion keys missmatch")
 
     for name in columns_name:
         if name in conversion:
             if not callable(conversion[name]):
-                raise Exception('Collate (DF)DataPipe requires callable as dict values')
+                raise RuntimeError(
+                    "Collate (DF)DataPipe requires callable as dict values"
+                )
             collation_fn = conversion[name]
         else:
             # TODO(VitalyFedyunin): Add default collation into df_wrapper
             try:
                 import torcharrow.pytorch as tap  # type: ignore[import]
+
                 collation_fn = tap.rec.Default()
             except Exception as e:
-                raise Exception("unable to import default collation function from the TorchArrow") from e
+                raise RuntimeError(
+                    "unable to import default collation function from the TorchArrow"
+                ) from e
 
         tuple_names.append(str(name))
         value = collation_fn(df[name])
@@ -172,6 +182,7 @@ def _collate_helper(conversion, item):
 class CollatorIterDataPipe(MapperIterDataPipe):
     r"""
     Collates samples from DataPipe to Tensor(s) by a custom collate function (functional name: ``collate``).
+
     By default, it uses :func:`torch.utils.data.default_collate`.
 
     .. note::
@@ -213,11 +224,8 @@ class CollatorIterDataPipe(MapperIterDataPipe):
     def __init__(
         self,
         datapipe: IterDataPipe,
-        conversion: Optional[
-            Union[
-            Callable[..., Any],
-            Dict[Union[str, Any], Union[Callable, Any]],
-            ]
+        conversion: Union[
+            Callable[..., Any], dict[Union[str, Any], Union[Callable, Any]], None
         ] = default_collate,
         collate_fn: Optional[Callable] = None,
     ) -> None:

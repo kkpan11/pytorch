@@ -1,20 +1,12 @@
+# mypy: allow-untyped-defs
 import collections
 import dataclasses
 import enum
 import itertools as it
 import logging
-from typing import (
-    Any,
-    cast,
-    DefaultDict,
-    Dict,
-    Iterator,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from collections.abc import Iterator
+from typing import Any, cast, Optional, Union
+from typing_extensions import Literal
 
 import torch
 from torch._C import FunctionSchema
@@ -30,9 +22,12 @@ from torch._C._profiler import (
 from torch._utils import _element_size
 from torch.profiler import _utils
 
-TensorAndID = Tuple["TensorKey", int]
+
+KeyAndID = tuple["Key", int]
+TensorAndID = tuple["TensorKey", int]
 
 log = logging.getLogger(__name__)
+
 
 class Category(enum.Enum):
     INPUT = enum.auto()
@@ -42,6 +37,7 @@ class Category(enum.Enum):
     AUTOGRAD_DETAIL = enum.auto()
     PARAMETER = enum.auto()
     OPTIMIZER_STATE = enum.auto()
+
 
 _CATEGORY_TO_COLORS = {
     Category.PARAMETER: "darkgreen",
@@ -56,11 +52,20 @@ _CATEGORY_TO_COLORS = {
 
 _CATEGORY_TO_INDEX = {c: i for i, c in enumerate(_CATEGORY_TO_COLORS)}
 
+
 class Action(enum.Enum):
     PREEXISTING = enum.auto()
     CREATE = enum.auto()
     INCREMENT_VERSION = enum.auto()
     DESTROY = enum.auto()
+
+
+_ACTION_TO_INDEX = {i: i.value for i in Action}
+
+
+@dataclasses.dataclass(eq=True, unsafe_hash=False, frozen=True)
+class Key:
+    device: torch.device
 
 
 @dataclasses.dataclass
@@ -77,7 +82,7 @@ class _Storage:
     def __repr__(self) -> str:
         return f"{hex(self.ptr):>18} ({self.allocation_id})"
 
-    def __eq__(self, other: Any) -> bool:
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, _Storage) and self.allocation_id == other.allocation_id
 
     def __hash__(self) -> int:
@@ -85,7 +90,7 @@ class _Storage:
 
 
 @dataclasses.dataclass(eq=True, unsafe_hash=True, frozen=True)
-class TensorKey:
+class TensorKey(Key):
     """Hashable identifier for a storage which has been asigned an ID.
 
     A detailed description of Tensor IDs and why they are needed is given in
@@ -97,7 +102,6 @@ class TensorKey:
 
     id: int
     storage: _Storage
-    device: torch.device
 
     def __repr__(self) -> str:
         return f"id={self.id}: {repr(self.storage):<24} ({self.device})"
@@ -117,7 +121,7 @@ class TensorKey:
             and storage_ptr is not None
             and allocation_id is not None
         ):
-            return TensorKey(tensor_id, _Storage(storage_ptr, allocation_id), device)
+            return TensorKey(device, tensor_id, _Storage(storage_ptr, allocation_id))
         return None
 
     @classmethod
@@ -131,13 +135,13 @@ class TensorKey:
         return None
 
     @property
-    def _as_sortable(self) -> Tuple[int, int, str, int]:
+    def _as_sortable(self) -> tuple[int, int, str, int]:
         return self.id, self.storage.allocation_id, self.device.type, self.device.index
 
 
 def _extract_parameters_and_gradients(
     node: _ProfilerEvent,
-) -> Iterator[Tuple[Optional[TensorKey], Optional[TensorKey]]]:
+) -> Iterator[tuple[Optional[TensorKey], Optional[TensorKey]]]:
     children = node.children
 
     # AccumulateGrad is used in the Autograd engine to handle gradient updates.
@@ -178,20 +182,20 @@ def _extract_parameters_and_gradients(
 
 
 def extract_parameters(node: _ProfilerEvent) -> Iterator[TensorKey]:
-    for p, p_grad in _extract_parameters_and_gradients(node):
+    for p, _p_grad in _extract_parameters_and_gradients(node):
         if p is not None:
             yield p
 
 
 def extract_gradients(
     node: _ProfilerEvent,
-) -> Iterator[Tuple[Optional[TensorKey], TensorKey]]:
+) -> Iterator[tuple[Optional[TensorKey], TensorKey]]:
     for p, p_grad in _extract_parameters_and_gradients(node):
         if p_grad is not None:
             yield p, p_grad
 
 
-def get_scopes(event: Optional[_ProfilerEvent]) -> Tuple[RecordScope, ...]:
+def get_scopes(event: Optional[_ProfilerEvent]) -> tuple[RecordScope, ...]:
     scopes = []
     while event:
         if event.typed[0] == _EventType.TorchOp:
@@ -214,7 +218,7 @@ class SchemaMatcher:
     """
 
     @classmethod
-    def inputs_are_mutable(cls, t: _ExtraFields_TorchOp) -> Tuple[Optional[bool], ...]:
+    def inputs_are_mutable(cls, t: _ExtraFields_TorchOp) -> tuple[Optional[bool], ...]:
         """Determine which inputs may have mutated based on function schema.
 
         Note that we don't need to resolve down to a single schema to perform
@@ -223,7 +227,7 @@ class SchemaMatcher:
         overload. If we cannot find any valid schema then we must be
         conservative and assume all inputs are mutable.
         """
-        mutable: Optional[List[bool]] = None
+        mutable: Optional[list[bool]] = None
         for schema in cls.match_schemas(t):
             mutable = mutable or [False for _ in schema.arguments]
             for i, arg in enumerate(schema.arguments):
@@ -232,7 +236,7 @@ class SchemaMatcher:
         return tuple(mutable or (None for _ in t.inputs))
 
     @classmethod
-    def match_schemas(cls, t: _ExtraFields_TorchOp) -> Tuple[FunctionSchema, ...]:
+    def match_schemas(cls, t: _ExtraFields_TorchOp) -> tuple[FunctionSchema, ...]:
         signature = tuple(
             # Tensor
             TensorKey.from_tensor(i) if isinstance(i, _TensorMetadata)
@@ -267,7 +271,7 @@ class SchemaMatcher:
                 isinstance(i, TensorKey) for i in observed
             )
 
-        type_map: Tuple[Tuple[Any, Union[type, Tuple[type, ...]]], ...] = (
+        type_map: tuple[tuple[Any, Union[type, tuple[type, ...]]], ...] = (
             (torch._C.TensorType, TensorKey),
             (torch._C.NoneType, type(None)),
             (torch._C.BoolType, bool),
@@ -288,7 +292,7 @@ class SchemaMatcher:
         return observed is None
 
     @staticmethod
-    def lookup_schemas(name: str) -> Optional[Tuple[FunctionSchema, ...]]:
+    def lookup_schemas(name: str) -> Optional[tuple[FunctionSchema, ...]]:
         # TODO(robieta):
         #   _jit_get_schemas_for_operator is quite expensive. (~100us / call)
         #   Consider adding `functools.lru_cache` if that becomes an issue.
@@ -302,6 +306,8 @@ class SchemaMatcher:
             # Note that record_function annotations also go through this path,
             # so it is expected that some names will not correspond to PyTorch
             # operators.
+            if "::" not in name:
+                return None
             return tuple(torch._C._jit_get_schemas_for_operator(name))
         except RuntimeError:
             return None
@@ -316,13 +322,13 @@ class OpTree:
         yield from _utils.traverse_dfs(self._root_nodes, *args, **kwargs)
 
     @property
-    def sorted_nodes(self) -> Tuple[_ProfilerEvent, ...]:
+    def sorted_nodes(self) -> tuple[_ProfilerEvent, ...]:
         return self._sorted_nodes
 
 
 class SizeMap:
     def __init__(self, op_tree: OpTree) -> None:
-        self._values: Dict[TensorKey, int] = {}
+        self._values: dict[TensorKey, int] = {}
 
         for node in op_tree.sorted_nodes:
             if node.typed[0] == _EventType.TorchOp:
@@ -344,7 +350,7 @@ class SizeMap:
                         for _, t in state:
                             self._update_values(t)
 
-        allocations: Dict[TensorKey, int] = {}
+        allocations: dict[TensorKey, int] = {}
         for node in op_tree.sorted_nodes:
             if node.typed[0] == _EventType.Allocation:
                 alloc_fields = node.typed[1]
@@ -405,7 +411,7 @@ class DataFlowNode:
     def __init__(self, event: _ProfilerEvent, graph: "DataFlowGraph") -> None:
         self._event = event
         self._graph = graph
-        self._edges: Dict[TensorKey, DataFlowEdge] = self._determine_edges()
+        self._edges: dict[TensorKey, DataFlowEdge] = self._determine_edges()
 
         for key, edge in self._edges.items():
             if edge.mutated and not edge.is_allocation:
@@ -415,11 +421,11 @@ class DataFlowNode:
         versions = {k: (v, self._graph.lookup(k)) for k, v in self.outputs.items()}
         assert all(i == j for i, j in versions.values()), f"{versions}, {self._edges}"
 
-    def _determine_edges(self) -> Dict[TensorKey, DataFlowEdge]:
+    def _determine_edges(self) -> dict[TensorKey, DataFlowEdge]:
         subtree = tuple(_utils.traverse_dfs([self._event]))
 
         # Start by populating edges from op inputs and outputs.
-        mutable_by_key: Dict[Optional[TensorKey], Set[Optional[bool]]] = {}
+        mutable_by_key: dict[Optional[TensorKey], set[Optional[bool]]] = {}
         for op in (i.typed[1] for i in subtree if i.typed[0] == _EventType.TorchOp):
             for op_input, mutable in zip(
                 op.inputs, SchemaMatcher.inputs_are_mutable(op)
@@ -435,7 +441,7 @@ class DataFlowNode:
                         key = TensorKey.from_tensor(op_input_i)
                         mutable_by_key.setdefault(key, set()).add(mutable)
 
-        edges: DefaultDict[Optional[TensorKey], DataFlowEdge]
+        edges: collections.defaultdict[Optional[TensorKey], DataFlowEdge]
         edges = collections.defaultdict(DataFlowEdge)
         for key, mutable_set in mutable_by_key.items():
             if key is not None:
@@ -467,7 +473,7 @@ class DataFlowNode:
         return dict(sorted((k, v) for k, v in edges.items() if k is not None))
 
     @property
-    def inputs(self) -> Dict[TensorKey, Tuple[bool, int]]:
+    def inputs(self) -> dict[TensorKey, tuple[bool, int]]:
         return {
             # MyPy can't see through `is_allocation` to know that
             # `v.input_version` is not None.
@@ -477,7 +483,7 @@ class DataFlowNode:
         }
 
     @property
-    def outputs(self) -> Dict[TensorKey, int]:
+    def outputs(self) -> dict[TensorKey, int]:
         return {
             k: 0 if v.input_version is None else v.input_version + 1
             for k, v in self._edges.items()
@@ -485,7 +491,7 @@ class DataFlowNode:
         }
 
     @property
-    def intermediates(self) -> Tuple[TensorKey, ...]:
+    def intermediates(self) -> tuple[TensorKey, ...]:
         return tuple(
             k for k, v in self._edges.items() if v.is_allocation and v.is_deletion
         )
@@ -499,18 +505,18 @@ class DataFlowGraph:
     def __init__(self, op_tree: OpTree) -> None:
         self._op_tree = op_tree
         self._leaf_events = self._extract_leaf_events(op_tree)
-        self._active_version: Dict[TensorKey, Optional[int]] = {}
+        self._active_version: dict[TensorKey, Optional[int]] = {}
         self._flow_nodes = [DataFlowNode(e, self) for e in self.leaf_events]
         self._flow_nodes.sort(key=lambda x: x.start_time)
         self.validate()
 
     @property
-    def flow_nodes(self) -> Tuple[DataFlowNode, ...]:
+    def flow_nodes(self) -> tuple[DataFlowNode, ...]:
         return tuple(self._flow_nodes)
 
     def validate(self):
         # Check that each (Tensor, version) pair has a unique creation node
-        outputs: Set[Tuple[TensorKey, int]] = set()
+        outputs: set[tuple[TensorKey, int]] = set()
         for node in self.flow_nodes:
             node_outputs = set(node.outputs.items())
             duplicates = outputs & node_outputs
@@ -518,7 +524,7 @@ class DataFlowGraph:
             outputs |= node_outputs
 
         # And check that `self._nodes` forms a valid topologically sorted DAG.
-        tensor_versions: Dict[TensorKey, int] = {}
+        tensor_versions: dict[TensorKey, int] = {}
         for node in self.flow_nodes:
             for key, (_, version) in node.inputs.items():
                 expected = tensor_versions.get(key, 0)
@@ -530,11 +536,11 @@ class DataFlowGraph:
                 tensor_versions[key] = version
 
     @property
-    def leaf_events(self) -> Tuple[_ProfilerEvent, ...]:
+    def leaf_events(self) -> tuple[_ProfilerEvent, ...]:
         return self._leaf_events
 
     @staticmethod
-    def _extract_leaf_events(op_tree: OpTree) -> Tuple[_ProfilerEvent, ...]:
+    def _extract_leaf_events(op_tree: OpTree) -> tuple[_ProfilerEvent, ...]:
         """Partially traverse the op tree and extract top level ops.
 
         Consider the following code:
@@ -566,7 +572,7 @@ class DataFlowGraph:
         form the logical nodes in our data flow graph.
         """
 
-        leaf_events: List[_ProfilerEvent] = []
+        leaf_events: list[_ProfilerEvent] = []
 
         def leaf_op(e: _ProfilerEvent) -> bool:
             return e.typed[0] == _EventType.TorchOp and (
@@ -604,17 +610,17 @@ class DataFlowGraph:
 @dataclasses.dataclass
 class CategoryElement:
     by_id: Optional[Category] = None
-    by_key: Dict[TensorKey, Category] = dataclasses.field(default_factory=dict)
-    by_version: Dict[TensorAndID, Category] = dataclasses.field(default_factory=dict)
+    by_key: dict[TensorKey, Category] = dataclasses.field(default_factory=dict)
+    by_version: dict[TensorAndID, Category] = dataclasses.field(default_factory=dict)
 
     # Used by unit tests to check internals. (And consequently by
     # MemoryProfile.lookup) This should not be used in any other capacity.
-    _by_id_keyset: Set[TensorKey] = dataclasses.field(default_factory=set)
+    _by_id_keyset: set[TensorKey] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
 class CategoryDict:
-    _values: DefaultDict[int, CategoryElement] = dataclasses.field(
+    _values: collections.defaultdict[int, CategoryElement] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(CategoryElement)
     )
 
@@ -633,7 +639,9 @@ class CategoryDict:
     ) -> None:
         self._values[key.id].by_version.setdefault((key, version), category)
 
-    def get(self, key: TensorKey, version: int) -> Optional[Category]:
+    def get(self, key: Key, version: int) -> Optional[Category]:
+        if isinstance(key, Key) and not isinstance(key, TensorKey):
+            return None
         element = self._values[key.id]
         return (
             element.by_id
@@ -658,20 +666,43 @@ class MemoryProfile:
         self._set_autograd_detail()
 
     @property
-    def timeline(self) -> Tuple[Tuple[int, Action, TensorAndID, int], ...]:
-        allocation_times: Dict[Tuple[TensorKey, bool], int] = {}
+    def timeline(self) -> tuple[tuple[int, Action, KeyAndID, int], ...]:
+        output: list[tuple[int, Action, KeyAndID, int]] = []
+        allocation_times: dict[tuple[TensorKey, bool], int] = {}
+        live_unknown: dict[tuple[int, torch.device], Literal[True]] = {}
         for event in self._op_tree.dfs():
             if event.typed[0] == _EventType.Allocation:
                 alloc_fields = event.typed[1]
-                key = TensorKey.from_allocation(alloc_fields)
-                if key is not None:
-                    is_allocation = alloc_fields.alloc_size > 0
-                    allocation_times[(key, is_allocation)] = event.start_time_ns
+                alloc_size = alloc_fields.alloc_size
+                is_allocation = alloc_size > 0
+                t = event.start_time_ns
+
+                tkey = TensorKey.from_allocation(alloc_fields)
+                if tkey is not None:
+                    allocation_times[(tkey, is_allocation)] = t
+
+                else:
+                    key = Key(alloc_fields.device)
+                    ptr_and_device = (alloc_fields.ptr, key.device)
+                    if is_allocation:
+                        if ptr_and_device in live_unknown:
+                            output.append(
+                                (t, Action.INCREMENT_VERSION, (key, 0), alloc_size)
+                            )
+                        else:
+                            live_unknown[ptr_and_device] = True
+                            output.append((t, Action.CREATE, (key, 0), alloc_size))
+                    else:
+                        output.append((t, Action.DESTROY, (key, 0), -alloc_size))
+                        if not live_unknown.pop(ptr_and_device, False):
+                            output.append(
+                                (-1, Action.PREEXISTING, (key, 0), -alloc_size)
+                            )
 
         snapshot = self._category_snapshot()
         last_version = dict(sorted(snapshot.keys()))
 
-        events: List[Tuple[int, Action, TensorAndID]] = [
+        events: list[tuple[int, Action, TensorAndID]] = [
             (-1, Action.PREEXISTING, (key, version))
             for key, version in snapshot.keys()
             if (key, True) not in allocation_times and version == 0
@@ -693,32 +724,34 @@ class MemoryProfile:
                     t = allocation_times[(key, False)]
                     events.append((t, Action.DESTROY, (key, last_version[key])))
 
-        events.sort(key=lambda x: (x[0], x[1].value))
-        return tuple(
+        output.extend(
             (time, action, (key, version), self._size_map[key])
             for time, action, (key, version) in events
         )
 
+        output.sort(key=lambda x: (x[0], x[1].value))
+        return tuple(output)
+
     def _is_gradient(self, *args, **kwargs) -> bool:
         return self._categories.get(*args, **kwargs) == Category.GRADIENT
 
-    def _category_snapshot(self) -> Dict[TensorAndID, Optional[Category]]:
-        all_tensor_versions: Set[TensorAndID] = set()
+    def _category_snapshot(self) -> dict[TensorAndID, Optional[Category]]:
+        all_tensor_versions: set[TensorAndID] = set()
 
         for node in self._data_flow_graph.flow_nodes:
             all_tensor_versions.update(((k, v) for k, (_, v) in node.inputs.items()))
-            all_tensor_versions.update(((key, 0) for key in node.intermediates))
+            all_tensor_versions.update((key, 0) for key in node.intermediates)
             all_tensor_versions.update(node.outputs.items())
 
         for i in self._categories._values.values():
-            all_tensor_versions.update(((key, 0) for key in i._by_id_keyset))
+            all_tensor_versions.update((key, 0) for key in i._by_id_keyset)
 
         return {
             (key, version): self._categories.get(key, version)
             for key, version in sorted(all_tensor_versions)
         }
 
-    def _any_version_depends_on_gradient(self) -> Set[int]:
+    def _any_version_depends_on_gradient(self) -> set[int]:
         """Extract IDs of Tensors which depend or will depend on a gradient.
 
         Note that this weakened definition of "depends" requires us to loop
@@ -729,7 +762,7 @@ class MemoryProfile:
         acyclic data flow graph into a cyclic graph and we are attempting to
         partition cycles involving a gradient from the rest of the graph.
         """
-        depends_on_gradient: Set[int] = set()
+        depends_on_gradient: set[int] = set()
         while True:
             start_size = len(depends_on_gradient)
             for node in self._data_flow_graph.flow_nodes:
@@ -805,7 +838,7 @@ class MemoryProfile:
 
         # We only want to annotate Tensors which actually contribute to the
         # model calculation.
-        produces_gradient: Set[TensorAndID] = set()
+        produces_gradient: set[TensorAndID] = set()
         for node in reversed(self._data_flow_graph.flow_nodes):
             tensors = {(key, version) for key, (_, version) in node.inputs.items()}
             tensors |= node.outputs.items()
@@ -862,8 +895,8 @@ class MemoryProfile:
         # data flow. Note this these are only candidates; we filter nodes that
         # we know are part of the backward pass but that doesn't guarantee that
         # they are part of the forward pass.
-        candidate_parameters: Set[TensorAndID] = set()
-        candidate_fwd_tensors: Set[TensorAndID] = {
+        candidate_parameters: set[TensorAndID] = set()
+        candidate_fwd_tensors: set[TensorAndID] = {
             i for i, category in snapshot.items() if category == Category.INPUT
         }
 
@@ -882,14 +915,15 @@ class MemoryProfile:
                 candidate_parameters |= inputs.difference(candidate_fwd_tensors)
 
         # Require that each parameter eventually contributes to the value of a gradient
-        used_for_gradient: Set[TensorAndID] = set()
+        used_for_gradient: set[TensorAndID] = set()
         for node in reversed(self._data_flow_graph.flow_nodes):
             if any(
                 self._is_gradient(*i) or i in used_for_gradient
                 for i in node.outputs.items()
             ):
-                for key, (_, version) in node.inputs.items():
-                    used_for_gradient.add((key, version))
+                used_for_gradient.update(
+                    (key, version) for key, (_, version) in node.inputs.items()
+                )
         candidate_parameters.intersection_update(used_for_gradient)
 
         # and depends on a gradient.
@@ -938,6 +972,7 @@ class MemoryProfile:
                             key, version, Category.AUTOGRAD_DETAIL
                         )
 
+
 class MemoryProfileTimeline:
     def __init__(self, memory_profile):
         """The minimum representation of the memory profile timeline
@@ -959,8 +994,8 @@ class MemoryProfileTimeline:
         Output: [timestamps, sizes by category]
         """
         device = torch.device(device_str)
-        times: List[int] = []
-        sizes: List[List[float]] = []
+        times: list[int] = []
+        sizes: list[list[int]] = []
 
         def update(key, version, delta):
             category = (
@@ -969,21 +1004,25 @@ class MemoryProfileTimeline:
                 else None
             )
             index = _CATEGORY_TO_INDEX[category] + 1
-            sizes[-1][index] += delta
+            sizes[-1][index] += int(delta)
 
         t_min = -1
         for t, action, (key, version), numbytes in self.timeline:
             if key.device != device:
                 continue
 
+            # Convert timestamps from ns to us, to match trace events.
+            if t != -1:
+                t = int(t / 1000)
+
             # Save the smallest timestamp to populate pre-existing allocs.
             if t_min == -1 or (t < t_min and t > 0):
                 t_min = t
 
             # Handle timestep
-            if not times:
+            if len(times) == 0:
                 times.append(t)
-                sizes.append([0.0] + [0.0 for _ in _CATEGORY_TO_INDEX])
+                sizes.append([0] + [0 for _ in _CATEGORY_TO_INDEX])
 
             elif t != times[-1]:
                 times.append(t)
@@ -1006,35 +1045,114 @@ class MemoryProfileTimeline:
         times = [t_min if t < 0 else t for t in times]
         return times, sizes
 
-    def export_memory_timeline(self, path, device) -> None:
+    def export_memory_timeline(self, path, device_str) -> None:
         """Saves the memory timeline as [times, sizes by category]
         as a JSON formatted file to the given path for the given
         device."""
-        times, sizes = self._coalesce_timeline(device)
+        times, sizes = self._coalesce_timeline(device_str)
         # TODO: Write a faster serialize (orjson not available in CI)
         import json
-        with open(path, 'w') as f:
+
+        with open(path, "w") as f:
             json.dump([times, sizes], f)
 
-    def export_memory_timeline_html(self, path, device, figsize=(20, 12), title=None) -> None:
+    def export_memory_timeline_raw(self, path, device_str) -> None:
+        """Saves the memory timeline as raw memory event tuples in the
+        form of (timestamp, action, numbytes, category)
+        as a JSON formatted file to the given path for the given
+        device."""
+        device = torch.device(device_str)
+        raw_events: list[tuple[int, int, int, int]] = []
+
+        def get_category_index(key, version):
+            category = (
+                self.categories.get(key, version)
+                if isinstance(key, TensorKey)
+                else None
+            )
+            return _CATEGORY_TO_INDEX[category]
+
+        for t, action, (key, version), numbytes in self.timeline:
+            if key.device != device:
+                continue
+
+            if action in (Action.PREEXISTING, Action.CREATE):
+                raw_events.append(
+                    (
+                        t,
+                        _ACTION_TO_INDEX[action],
+                        numbytes,
+                        get_category_index(key, version),
+                    )
+                )
+
+            elif action == Action.INCREMENT_VERSION:
+                raw_events.append(
+                    (
+                        t,
+                        _ACTION_TO_INDEX[action],
+                        -numbytes,
+                        get_category_index(key, version),
+                    )
+                )
+                raw_events.append(
+                    (
+                        t,
+                        _ACTION_TO_INDEX[action],
+                        numbytes,
+                        get_category_index(key, version + 1),
+                    )
+                )
+
+            elif action == Action.DESTROY:
+                raw_events.append(
+                    (
+                        t,
+                        _ACTION_TO_INDEX[action],
+                        -numbytes,
+                        get_category_index(key, version),
+                    )
+                )
+
+            else:
+                raise ValueError(f"Unknown action: {action}")
+
+        import json
+
+        with open(path, "w") as f:
+            json.dump(raw_events, f)
+
+    def export_memory_timeline_html(
+        self, path, device_str, figsize=(20, 12), title=None
+    ) -> None:
         """Exports the memory timeline as an HTML file which contains
         the memory timeline plot embedded as a PNG file."""
         # Check if user has matplotlib installed, return gracefully if not.
         import importlib.util
+
         matplotlib_spec = importlib.util.find_spec("matplotlib")
         if matplotlib_spec is None:
-            print("export_memory_timeline_html failed because matplotlib was not found.")
+            print(
+                "export_memory_timeline_html failed because matplotlib was not found."
+            )
             return
+
+        from base64 import b64encode
+        from os import remove
+        from tempfile import NamedTemporaryFile
 
         import matplotlib.pyplot as plt
         import numpy as np
-        from base64 import b64encode
-        from tempfile import NamedTemporaryFile
-        from os import remove
 
-        mt = self._coalesce_timeline(device)
+        mt = self._coalesce_timeline(device_str)
         times, sizes = np.array(mt[0]), np.array(mt[1])
+        # For this timeline, start at 0 to match Chrome traces.
+        t_min = min(times)
+        times -= t_min
         stacked = np.cumsum(sizes, axis=1) / 1024**3
+        device = torch.device(device_str)
+        max_memory_allocated = torch.cuda.max_memory_allocated(device)
+        max_memory_reserved = torch.cuda.max_memory_reserved(device)
 
         # Plot memory timeline as stacked data
         fig = plt.figure(figsize=figsize, dpi=80)
@@ -1045,27 +1163,32 @@ class MemoryProfileTimeline:
                 times / 1e3, stacked[:, i], stacked[:, i + 1], color=color, alpha=0.7
             )
         fig.legend(["Unknown" if i is None else i.name for i in _CATEGORY_TO_COLORS])
-        axes.set_xlabel("Time (us)")
+        # Usually training steps are in magnitude of ms.
+        axes.set_xlabel("Time (ms)")
         axes.set_ylabel("Memory (GB)")
         title = "\n\n".join(
-            ([title] if title else []) + [f"Max: {stacked[:, -1].max():.2f} GB"]
+            ([title] if title else [])
+            + [
+                f"Max memory allocated: {max_memory_allocated / (1024**3):.2f} GiB \n"
+                f"Max memory reserved: {max_memory_reserved / (1024**3):.2f} GiB"
+            ]
         )
         axes.set_title(title)
 
         # Embed the memory timeline image into the HTML file
-        tmpfile = NamedTemporaryFile('wb', suffix='.png', delete=False)
+        tmpfile = NamedTemporaryFile("wb", suffix=".png", delete=False)
         tmpfile.close()
-        fig.savefig(tmpfile.name, format='png')
+        fig.savefig(tmpfile.name, format="png")
 
-        with open(tmpfile.name, 'rb') as tmp:
-            encoded = b64encode(tmp.read()).decode('utf-8')
-            html = """<html>
+        with open(tmpfile.name, "rb") as tmp:
+            encoded = b64encode(tmp.read()).decode("utf-8")
+            html = f"""<html>
 <head><meta charset="utf-8" /><title>GPU Memory Timeline HTML</title></head>
 <body>
-  <img src=\'data:image/png;base64,{}\'>
+  <img src='data:image/png;base64,{encoded}'>
 </body>
-</html>""".format(encoded)
+</html>"""
 
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 f.write(html)
         remove(tmpfile.name)

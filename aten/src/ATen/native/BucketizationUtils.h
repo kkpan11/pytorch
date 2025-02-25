@@ -10,8 +10,7 @@
 #include <ATen/ops/result_type.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 // original values given by raw_*. If an original value is not contiguous, will make a contiguous copy to
 // the corresponding trimmed_* value. Additionally, if the dtypes of the boundary and input tensor do not
@@ -108,10 +107,10 @@ inline void searchsorted_pre_check(
     const Tensor& output,
     const bool out_int32,
     const bool right,
-    const c10::optional<c10::string_view> side_opt,
+    const std::optional<std::string_view> side_opt,
     const Tensor& sorter) {
   if (side_opt) {
-    const c10::string_view side = *side_opt;
+    const std::string_view side = *side_opt;
     TORCH_CHECK(side == "left" || side == "right", "torch.searchsorted(): side can only be 'left' or 'right' but ",
       "got ", side);
 
@@ -171,4 +170,4 @@ inline void searchsorted_pre_check(
   }
 }
 
-}}
+} // namespace at::native

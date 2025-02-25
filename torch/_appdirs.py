@@ -53,6 +53,7 @@ __version_info__ = tuple(int(segment) for segment in __version__.split("."))
 import os
 import sys
 
+
 unicode = str
 
 if sys.platform.startswith("java"):
@@ -514,7 +515,7 @@ def _get_win_folder_from_registry(csidl_name):
         _winreg.HKEY_CURRENT_USER,
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
     )
-    dir, type = _winreg.QueryValueEx(key, shell_folder_name)
+    dir, _type = _winreg.QueryValueEx(key, shell_folder_name)
     return dir
 
 
@@ -643,24 +644,24 @@ if __name__ == "__main__":
         "site_config_dir",
     )
 
-    print("-- app dirs %s --" % __version__)
+    print(f"-- app dirs {__version__} --")
 
     print("-- app dirs (with optional 'version')")
     dirs = AppDirs(appname, appauthor, version="1.0")
     for prop in props:
-        print("%s: %s" % (prop, getattr(dirs, prop)))
+        print(f"{prop}: {getattr(dirs, prop)}")
 
     print("\n-- app dirs (without optional 'version')")
     dirs = AppDirs(appname, appauthor)
     for prop in props:
-        print("%s: %s" % (prop, getattr(dirs, prop)))
+        print(f"{prop}: {getattr(dirs, prop)}")
 
     print("\n-- app dirs (without optional 'appauthor')")
     dirs = AppDirs(appname)
     for prop in props:
-        print("%s: %s" % (prop, getattr(dirs, prop)))
+        print(f"{prop}: {getattr(dirs, prop)}")
 
     print("\n-- app dirs (with disabled 'appauthor')")
     dirs = AppDirs(appname, appauthor=False)
     for prop in props:
-        print("%s: %s" % (prop, getattr(dirs, prop)))
+        print(f"{prop}: {getattr(dirs, prop)}")

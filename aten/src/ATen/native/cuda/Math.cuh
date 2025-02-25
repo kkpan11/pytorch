@@ -5,8 +5,7 @@
 #include <c10/macros/Macros.h>
 #include <ATen/native/cuda/jit_utils.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 // See note [Jiterator]
 // TODO: elaborate in this comment on the structure of math.cuh
 #if AT_USE_JITERATOR()
@@ -226,7 +225,7 @@ const auto lcm_string = jiterator_stringify(
 ); // lcm_string
 
 /*
- * For licensing information, please refer to the the cpu implementation located in "ATen/native/Math.h".
+ * For licensing information, please refer to the cpu implementation located in "ATen/native/Math.h".
  */
 // [C++ Standard Reference: Gamma Function] https://en.cppreference.com/w/cpp/numeric/math/tgamma
 const auto digamma_string = jiterator_stringify(
@@ -759,11 +758,10 @@ const auto sinc_string = jiterator_stringify(
   T sinc(T a) {
     if (a == T(0)) {
       return T(1);
-    } else {
-      constexpr T pi = T(3.14159265358979323846L);
-      T product = pi * a;
-      return std::sin(product) / product;
     }
+    constexpr T pi = T(3.14159265358979323846L);
+    T product = pi * a;
+    return std::sin(product) / product;
   }
 ); // sinc_string
 
@@ -2135,6 +2133,17 @@ const auto chebyshev_polynomial_w_string = jiterator_stringify(
 
 const auto hermite_polynomial_h_string = jiterator_stringify(
     template<typename T>
+    unsigned short getHermitianLimit() {
+        if (sizeof(T) <= sizeof(float)) {
+            return 128;
+        } else if (sizeof(T) <= sizeof(double)) {
+            return 512;
+        } else {
+            return 1024;
+        }
+    }
+
+    template<typename T>
     T hermite_polynomial_h_forward(T x, int64_t n) {
         if (n < 0) {
             return T(0.0);
@@ -2148,9 +2157,13 @@ const auto hermite_polynomial_h_string = jiterator_stringify(
             return x + x;
         }
 
+        if (n > getHermitianLimit<T>()) {
+            return NAN;
+        }
+
         T p = T(1.0);
         T q = x + x;
-        T r;
+        T r = T(0.0);
 
         for (int64_t k = 2; k < n + n; k += 2) {
             r = (x + x) * q - k * p;
@@ -2169,6 +2182,17 @@ const auto hermite_polynomial_h_string = jiterator_stringify(
 
 const auto hermite_polynomial_he_string = jiterator_stringify(
     template<typename T>
+    unsigned short getHermitianLimit() {
+        if (sizeof(T) <= sizeof(float)) {
+            return 128;
+        } else if (sizeof(T) <= sizeof(double)) {
+            return 512;
+        } else {
+            return 1024;
+        }
+    }
+
+    template<typename T>
     T hermite_polynomial_he_forward(T x, int64_t n) {
         if (n < 0) {
             return T(0.0);
@@ -2180,6 +2204,10 @@ const auto hermite_polynomial_he_string = jiterator_stringify(
 
         if (n == 1) {
             return x;
+        }
+
+        if (n > getHermitianLimit<T>()) {
+            return NAN;
         }
 
         T p = T(1.0);
@@ -3038,7 +3066,7 @@ static inline C10_HOST_DEVICE scalar_t calc_gcd(scalar_t a_in, scalar_t b_in) {
 }
 
 /*
- * For licensing information, please refer to the the cpu implementation located in "ATen/native/Math.h".
+ * For licensing information, please refer to the cpu implementation located in "ATen/native/Math.h".
  */
 template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_digamma(scalar_t in) {
@@ -3127,7 +3155,7 @@ static inline C10_HOST_DEVICE scalar_t calc_trigamma(scalar_t in) {
 }
 
 /*
- * For licensing information and documentation, please refer to the the cpu implementation located in "ATen/native/Math.h".
+ * For licensing information and documentation, please refer to the cpu implementation located in "ATen/native/Math.h".
  */
 template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t
@@ -3149,7 +3177,7 @@ chbevl(scalar_t _x, const scalar_t array[], size_t len) {
 }
 
 /*
- * For licensing information and documentation, please refer to the the cpu implementation located in "ATen/native/Math.h".
+ * For licensing information and documentation, please refer to the cpu implementation located in "ATen/native/Math.h".
  */
 template <typename T>
 C10_HOST_DEVICE inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_A() {
@@ -3211,22 +3239,18 @@ static inline C10_HOST_DEVICE scalar_t calc_i0(scalar_t _x) {
   scalar_t x = ::abs(_x);
 
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i0e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i0e_A<scalar_t>();
     scalar_t y = (x / scalar_t{2.0}) - scalar_t{2.0};
     return (::exp(x) * chbevl(y, A, len));
   }
 
-  auto coeff_pair = chebyshev_coefficients_i0e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i0e_B<scalar_t>();
   return (::exp(x) * chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len) / ::sqrt(x));
 }
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<double, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -3255,7 +3279,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<float, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -3285,7 +3309,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<double, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -3312,7 +3336,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<float, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -3335,17 +3359,13 @@ template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_i1(scalar_t _x) {
   const auto x = ::abs(_x);
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i1e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i1e_A<scalar_t>();
     scalar_t y = x / scalar_t{2.0} - scalar_t{2.0};
     const scalar_t out = ::exp(x) * x * chbevl(y, A, len);
     return (_x < scalar_t{0.0}) ? -out : out;
   }
 
-  auto coeff_pair = chebyshev_coefficients_i1e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i1e_B<scalar_t>();
   const scalar_t out = (::exp(x) * chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len)) / ::sqrt(x);
   return (_x < scalar_t{0.0}) ? -out : out;
 }
@@ -3354,22 +3374,17 @@ template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_i1e(scalar_t _x) {
   const auto x = ::abs(_x);
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i1e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i1e_A<scalar_t>();
     const scalar_t y = x / scalar_t{2.0} - scalar_t{2.0};
     const scalar_t out = chbevl(y, A, len) * x;
     return (_x < scalar_t{0.0}) ? -out : out;
   }
 
-  auto coeff_pair = chebyshev_coefficients_i1e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i1e_B<scalar_t>();
   const scalar_t out = chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len) / ::sqrt(x);
   return (_x < scalar_t{0.0}) ? -out : out;
 }
 
 #endif // AT_USE_JITERATOR() (this closes the "else" branch of a if/else preprocessor directive)
 
-} // namespace native
-} // namespace at
+} // namespace at::native

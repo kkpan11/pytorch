@@ -1,6 +1,12 @@
 # Owner(s): ["module: dynamo"]
+import unittest
+import warnings
+
 from torch._dynamo import config
 from torch._dynamo.testing import make_test_cls_with_patches
+from torch.fx.experimental import _config as fx_config
+from torch.testing._internal.common_utils import slowTest, TEST_Z3
+
 
 try:
     from . import (
@@ -12,6 +18,7 @@ try:
         test_misc,
         test_modules,
         test_repros,
+        test_sdpa,
         test_subgraphs,
     )
 except ImportError:
@@ -21,57 +28,37 @@ except ImportError:
     import test_functions
     import test_higher_order_ops
     import test_misc
+
     import test_modules
     import test_repros
+    import test_sdpa
     import test_subgraphs
-
-import unittest
 
 
 test_classes = {}
 
-ALL_DYNAMIC_XFAILS = {
-    "MiscTests": [],
-    "ReproTests": [
-        # Could not infer dtype of torch._C.SymIntNode
-        "test_convert_boxes_to_pooler_format",
-    ],
-    "SubGraphTests": [
-        "test_enumerate_not_break_graph",
-    ],
-}
 
-XFAIL_HITS = 0
-
-
-def make_dynamic_cls(cls, *, static_default=False):
+def make_dynamic_cls(cls):
     suffix = "_dynamic_shapes"
-    if static_default:
-        suffix += "_static_default"
 
     cls_prefix = "DynamicShapes"
-    if static_default:
-        cls_prefix = f"StaticDefault{cls_prefix}"
 
     test_class = make_test_cls_with_patches(
         cls,
         cls_prefix,
         suffix,
-        (config, "dynamic_shapes", True),
-        (config, "assume_static_by_default", static_default),
-        (config, "specialize_int", static_default),
+        (config, "assume_static_by_default", False),
+        (config, "specialize_int", False),
+        (fx_config, "translation_validation", TEST_Z3),
+        (fx_config, "check_shape_env_recorded_events", True),
+        (fx_config, "validate_shape_env_version_key", True),
+        xfail_prop="_expected_failure_dynamic",
     )
-
-    xfail_tests = ALL_DYNAMIC_XFAILS.get(cls.__name__)
-    if xfail_tests is not None:
-        global XFAIL_HITS
-        XFAIL_HITS += 1
-        for t in xfail_tests:
-            unittest.expectedFailure(getattr(test_class, f"{t}{suffix}"))
 
     test_classes[test_class.__name__] = test_class
     # REMOVING THIS LINE WILL STOP TESTS FROM RUNNING
     globals()[test_class.__name__] = test_class
+    test_class.__module__ = __name__
     return test_class
 
 
@@ -84,61 +71,40 @@ tests = [
     test_export.ExportTests,
     test_subgraphs.SubGraphTests,
     test_higher_order_ops.HigherOrderOpTests,
+    test_higher_order_ops.FuncTorchHigherOrderOpTests,
     test_aot_autograd.AotAutogradFallbackTests,
+    test_sdpa.TestSDPA,
 ]
 for test in tests:
     make_dynamic_cls(test)
-    make_dynamic_cls(test, static_default=True)
+del test
 
-assert XFAIL_HITS == len(ALL_DYNAMIC_XFAILS) * 2
+if TEST_Z3:
+    if not config.inline_inbuilt_nn_modules:
+        # TODO model is somehow not being freed when z3 is available
+        unittest.expectedFailure(
+            DynamicShapesMiscTests.test_parameter_free_dynamic_shapes  # noqa: F821
+        )
 
-# Single config failures
-
-unittest.expectedFailure(
-    DynamicShapesMiscTests.test_change_backends_dynamic_shapes
-    # '__torch__.torch.SymInt (of Python compilation unit at: 0x4c9c0e0)'
-    # object has no attribute or method '__ne__'
-    # NB: I don't think this ever can actually work, cuz TorchScript
-    # can't deal with SymInt inputs
+# Test takes too long ~700s as of 414a1fd29f04d06e41b7f895368dd1f83a4be29d
+DynamicShapesExportTests.test_retracibility_dynamic_shapes = slowTest(  # noqa: F821
+    DynamicShapesExportTests.test_retracibility_dynamic_shapes  # noqa: F821
 )
-
-
-unittest.expectedFailure(
-    DynamicShapesMiscTests.test_slice_input_dynamic_shapes
-    # NotImplementedError: SymNodeVariable() is not a constant
+# Also take more than 30m as of 15cc9f2e7e7b2b175f24755925dc38d4d430905d
+DynamicShapesExportTests.test_retracibility_dict_container_inp_out_dynamic_shapes = slowTest(  # noqa: F821
+    DynamicShapesExportTests.test_retracibility_dict_container_inp_out_dynamic_shapes  # noqa: F821
 )
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module1_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
-)
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module2_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
-)
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module3_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
-)
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module4_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
-)
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module5_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
-)
-
-unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module6_dynamic_shapes
-    # RuntimeError: SymIntArrayRef expected to contain only concrete integers
+DynamicShapesExportTests.test_retracibility_nested_list_out_dynamic_shapes = slowTest(  # noqa: F821
+    DynamicShapesExportTests.test_retracibility_nested_list_out_dynamic_shapes  # noqa: F821
 )
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
+
+    if not TEST_Z3:
+        warnings.warn(
+            "translation validation is off. "
+            "Testing with translation validation requires Z3."
+        )
 
     run_tests()
